@@ -1,0 +1,378 @@
+{
+  "basic": {
+    "description": "基础设置",
+    "hint": "指令开关、指令别名、冷却、每日上限与群/用户黑白名单。",
+    "type": "object",
+    "items": {
+      "enabled": {
+        "description": "是否启用点歌功能",
+        "hint": "关闭后所有点歌指令都不再响应，方便临时停用。",
+        "type": "bool",
+        "default": true
+      },
+      "command_aliases": {
+        "description": "指令别名列表",
+        "hint": "例如 [\"点歌\",\"听歌\",\"music\"]，每个别名都会注册成一条指令。",
+        "type": "list",
+        "default": ["点歌", "听歌", "music"]
+      },
+      "cooldown_seconds": {
+        "description": "同一用户冷却秒数",
+        "hint": "同一用户两次点歌之间至少间隔的秒数，0 表示不限制。",
+        "type": "int",
+        "default": 5
+      },
+      "daily_limit": {
+        "description": "每人每日点歌上限",
+        "hint": "同一用户每天最多点歌次数，0 表示不限制。",
+        "type": "int",
+        "default": 0
+      },
+      "group_whitelist": {
+        "description": "群聊白名单",
+        "hint": "非空时只有这些群可以使用；填 * 表示所有群。留空表示不限制群。",
+        "type": "list",
+        "default": []
+      },
+      "group_blacklist": {
+        "description": "群聊黑名单",
+        "hint": "这些群禁止点歌；填 * 表示所有群都禁止。优先级高于白名单。",
+        "type": "list",
+        "default": []
+      },
+      "user_blacklist": {
+        "description": "用户黑名单",
+        "hint": "这些用户禁止点歌；填 * 表示所有用户都禁止。",
+        "type": "list",
+        "default": []
+      }
+    }
+  },
+  "source": {
+    "description": "点歌来源",
+    "hint": "搜索歌曲的来源与网络参数（网易云官方接口或自建 API）。",
+    "type": "object",
+    "items": {
+      "provider": {
+        "description": "点歌来源",
+        "hint": "内置来源；当前提供 netease（网易云音乐）。",
+        "type": "string",
+        "default": "netease",
+        "options": ["netease"]
+      },
+      "netease_mode": {
+        "description": "网易云接入方式",
+        "hint": "official_direct=直连网易云官方接口（无需自建）；self_hosted_api=使用下方自建 API 基地址。",
+        "type": "string",
+        "default": "official_direct",
+        "options": ["official_direct", "self_hosted_api"]
+      },
+      "netease_api_base": {
+        "description": "自建网易云 API 基地址",
+        "hint": "仅当接入方式为 self_hosted_api 时生效，例如 http://127.0.0.1:3000。",
+        "type": "string",
+        "default": ""
+      },
+      "search_limit": {
+        "description": "搜索结果条数",
+        "hint": "请求搜索接口时返回的候选条数，范围 1-20。",
+        "type": "int",
+        "default": 5
+      },
+      "pick_strategy": {
+        "description": "选曲策略",
+        "hint": "top=命中歌手时优先取最匹配的一条；first=直接取搜索结果第一条。",
+        "type": "string",
+        "default": "top",
+        "options": ["top", "first"]
+      },
+      "search_timeout": {
+        "description": "搜索超时（秒）",
+        "hint": "搜索接口单次请求超时，建议 3-15 秒。",
+        "type": "float",
+        "default": 8.0
+      },
+      "api_timeout": {
+        "description": "接口超时（秒）",
+        "hint": "歌曲详情/歌词/评论等接口的单次请求超时，同时也是文转图渲染超时。",
+        "type": "float",
+        "default": 10.0
+      },
+      "max_retries": {
+        "description": "失败重试次数",
+        "hint": "网络请求失败后的重试次数，0 表示不重试。",
+        "type": "int",
+        "default": 2
+      },
+      "user_agent": {
+        "description": "请求 User-Agent",
+        "hint": "网易云接口需要浏览器 UA 才返回完整数据，一般无需修改。",
+        "type": "string",
+        "default": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+      },
+      "cookie": {
+        "description": "网易云 Cookie",
+        "hint": "可选。填写登录后的 Cookie 可提高音源/歌词可用性与评论数上限；留空表示匿名访问。",
+        "type": "string",
+        "default": "",
+        "secret": true
+      },
+      "fallback_to_plain": {
+        "description": "失败时降级为纯文本",
+        "hint": "卡片/图片渲染失败时改为发送文本链接，避免整条消息丢失。",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "card": {
+    "description": "歌曲卡片",
+    "hint": "歌曲卡片消息的开关、类型与展示内容。",
+    "type": "object",
+    "items": {
+      "card_enable": {
+        "description": "是否发送歌曲卡片",
+        "hint": "关闭后只发送歌词图/评论图。",
+        "type": "bool",
+        "default": true
+      },
+      "card_type": {
+        "description": "卡片类型",
+        "hint": "163=网易云官方音乐卡片（需客户端支持）；custom=自定义音乐卡片；share=链接分享卡片（兼容性最好）。",
+        "type": "string",
+        "default": "163",
+        "options": ["163", "custom", "share"]
+      },
+      "card_show_cover": {
+        "description": "卡片显示封面",
+        "hint": "是否在卡片上显示专辑封面。",
+        "type": "bool",
+        "default": true
+      },
+      "card_show_source": {
+        "description": "卡片显示来源",
+        "hint": "是否在卡片上标注来源（如“网易云音乐”）。",
+        "type": "bool",
+        "default": true
+      },
+      "card_attach_audio": {
+        "description": "卡片附带音频直链",
+        "hint": "开启后尝试把音频直链一并下发，部分平台可能无法播放。",
+        "type": "bool",
+        "default": false
+      },
+      "card_fallback": {
+        "description": "卡片失败兜底方式",
+        "hint": "share=改用分享卡片；text=只发纯文本。",
+        "type": "string",
+        "default": "share",
+        "options": ["share", "text"]
+      }
+    }
+  },
+  "lyrics": {
+    "description": "歌词（文转图）",
+    "hint": "歌词文本/歌词图的开关、渲染方式与样式。",
+    "type": "object",
+    "items": {
+      "lyrics_enable": {
+        "description": "是否发送歌词",
+        "hint": "关闭后不再处理歌词。",
+        "type": "bool",
+        "default": true
+      },
+      "lyrics_t2i": {
+        "description": "歌词渲染成图片",
+        "hint": "开启后把歌词渲染成图片发送；关闭则以文本形式发送。",
+        "type": "bool",
+        "default": true
+      },
+      "lyrics_render_mode": {
+        "description": "歌词渲染模式",
+        "hint": "network=只用网络文转图服务；local=只用本地渲染；auto=优先网络、失败自动本地兜底。",
+        "type": "string",
+        "default": "auto",
+        "options": ["network", "local", "auto"]
+      },
+      "lyrics_t2i_endpoint": {
+        "description": "自定义文转图端点",
+        "hint": "可选。填写自建 t2i 服务地址（形如 http://127.0.0.1:6100），留空则使用 AstrBot 内置文转图服务。",
+        "type": "string",
+        "default": ""
+      },
+      "lyrics_template": {
+        "description": "自定义歌词模板",
+        "hint": "可选。填写歌词卡片的 Jinja2/HTML 模板，留空使用内置模板。",
+        "type": "text",
+        "default": ""
+      },
+      "lyrics_width": {
+        "description": "歌词图宽度",
+        "hint": "歌词图片宽度（像素），常用 800-1000。",
+        "type": "int",
+        "default": 900
+      },
+      "lyrics_theme": {
+        "description": "歌词图主题",
+        "hint": "light=浅色；dark=深色。",
+        "type": "string",
+        "default": "light",
+        "options": ["light", "dark"]
+      },
+      "lyrics_font_size": {
+        "description": "歌词字号",
+        "hint": "歌词正文字号（像素），常用 18-28。",
+        "type": "int",
+        "default": 22
+      },
+      "lyrics_line_spacing": {
+        "description": "歌词行距",
+        "hint": "行距倍数，常用 1.2-2.0。",
+        "type": "float",
+        "default": 1.6
+      },
+      "lyrics_max_lines": {
+        "description": "歌词最大行数",
+        "hint": "超过该行数截断，0 表示不限制（发送全部歌词）。",
+        "type": "int",
+        "default": 200
+      },
+      "lyrics_show_meta": {
+        "description": "歌词图显示歌曲信息",
+        "hint": "是否在歌词图顶部显示歌名、歌手、专辑等信息。",
+        "type": "bool",
+        "default": true
+      },
+      "lyrics_highlight_translation": {
+        "description": "高亮显示翻译",
+        "hint": "有翻译歌词时，是否把翻译以弱化样式跟在原文下方。",
+        "type": "bool",
+        "default": true
+      },
+      "lyrics_fallback_text": {
+        "description": "歌词失败降级为文本",
+        "hint": "歌词图渲染失败时改为发送歌词文本。",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "comments": {
+    "description": "网易云评论",
+    "hint": "网易云热门/最新评论的条数与评论图样式。",
+    "type": "object",
+    "items": {
+      "comments_enable": {
+        "description": "是否发送网易云评论",
+        "hint": "关闭后不再请求评论。",
+        "type": "bool",
+        "default": true
+      },
+      "comments_t2i": {
+        "description": "评论渲染成图片",
+        "hint": "开启后把评论渲染成图片发送；关闭则以文本形式发送。",
+        "type": "bool",
+        "default": true
+      },
+      "comments_count": {
+        "description": "评论条数",
+        "hint": "每次展示的评论条数，范围 0-50。",
+        "type": "int",
+        "default": 10
+      },
+      "comments_sort": {
+        "description": "评论排序",
+        "hint": "hot=热门评论；new=最新评论。",
+        "type": "string",
+        "default": "hot",
+        "options": ["hot", "new"]
+      },
+      "comments_page": {
+        "description": "评论页码",
+        "hint": "从第几页开始取评论，1 表示第一页。",
+        "type": "int",
+        "default": 1
+      },
+      "comments_max_chars": {
+        "description": "单条评论最大字数",
+        "hint": "超出部分以省略号截断，0 表示不限制。",
+        "type": "int",
+        "default": 120
+      },
+      "comments_show_avatar": {
+        "description": "显示头像",
+        "hint": "评论图中是否显示用户头像（需要额外下载图片）。",
+        "type": "bool",
+        "default": true
+      },
+      "comments_show_likes": {
+        "description": "显示点赞数",
+        "hint": "评论图中是否显示点赞数。",
+        "type": "bool",
+        "default": true
+      },
+      "comments_show_reply": {
+        "description": "显示楼中楼回复",
+        "hint": "是否附带展示评论的回复内容。",
+        "type": "bool",
+        "default": false
+      },
+      "comments_reply_count": {
+        "description": "每条评论展示的回复数",
+        "hint": "显示楼中楼时每条评论最多展示几条回复，范围 0-10。",
+        "type": "int",
+        "default": 1
+      },
+      "comments_width": {
+        "description": "评论图宽度",
+        "hint": "评论图片宽度（像素），常用 800-1000。",
+        "type": "int",
+        "default": 900
+      },
+      "comments_theme": {
+        "description": "评论图主题",
+        "hint": "light=浅色；dark=深色。",
+        "type": "string",
+        "default": "light",
+        "options": ["light", "dark"]
+      },
+      "comments_font_size": {
+        "description": "评论字号",
+        "hint": "评论正文字号（像素），常用 16-24。",
+        "type": "int",
+        "default": 20
+      },
+      "comments_fallback_text": {
+        "description": "评论失败降级为文本",
+        "hint": "评论图渲染失败时改为发送评论文本。",
+        "type": "bool",
+        "default": true
+      }
+    }
+  },
+  "send": {
+    "description": "发送与调试",
+    "hint": "发送节奏、@ 行为与调试日志。",
+    "type": "object",
+    "items": {
+      "send_delay": {
+        "description": "分段发送间隔（秒）",
+        "hint": "卡片、歌词图、评论图之间的发送间隔，避免触发风控。",
+        "type": "float",
+        "default": 0.6
+      },
+      "reply_with_at": {
+        "description": "回复时 @ 发送者",
+        "hint": "开启后消息前缀带 @用户。",
+        "type": "bool",
+        "default": false
+      },
+      "debug_log": {
+        "description": "输出调试日志",
+        "hint": "开启后打印搜索/请求/渲染的详细日志，排障用。",
+        "type": "bool",
+        "default": false
+      }
+    }
+  }
+}

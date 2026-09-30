@@ -1,0 +1,35 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Tests
+.pytest_cache/
+.coverage
+htmlcov/
+coverage.xml
+.mypy_cache/
+.ruff_cache/
+
+# AstrBot 运行期数据目录：astrbot.core.utils.astrbot_path.get_astrbot_root()
+# 在 ASTRBOT_ROOT 未设置时回退到 cwd，导入 astrbot 的测试会在仓库里写出
+# data/cmd_config.json 与 data/t2i_templates/*.html。
+# tests/conftest.py 已把 ASTRBOT_ROOT 重定向到临时目录，这里再兜一层。
+data/
+
+# 本机工具产物
+.graphflow/
+graphflow-out/
+.agent-teams/
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+Thumbs.db
+Desktop.ini
+
+# Build artifacts
+dist/
+.graphflow-cache/
