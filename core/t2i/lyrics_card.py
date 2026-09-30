@@ -1,11 +1,11 @@
-"""歌词卡片渲染入口：HTML 模板 -> Markdown -> None 的三级降级。
+"""歌词卡片渲染入口：HTML 模板 -> 安全文本图 -> None 的降级链。
 
 AstrBot 侧事实（t2i/renderer.py、network_strategy.py、local_strategy.py）：
 
 - 自定义 HTML/Jinja2 模板只能走网络 t2i 端点（HtmlRenderer.render_custom_template
   -> NetworkRenderStrategy），本地策略只有 Pillow + Markdown 实现；
-- 因此本模块的降级链必须是 HTML -> Markdown -> None，且模板数据里要带
-  fallback_text，DefaultRenderer 在 mode="local" 时会直接用它做本地 Markdown 渲染。
+- 模板数据里要带 fallback_text，DefaultRenderer 在 mode="local" 时直接绘制
+  纯文本；旧渲染器使用经过实体转义的 Markdown，歌词不能触发图片 URL 加载。
 
 调用约定：
 
@@ -38,6 +38,7 @@ from .plain import (
 from .templates import (
     LYRICS_TEMPLATE,
     call_renderer,
+    escape_markdown_text,
     is_template_renderable,
 )
 
@@ -73,7 +74,7 @@ def build_lyrics_data(
     """组装 LYRICS_TEMPLATE 的数据（键名见 core/t2i/templates.py 模块文档）。
 
     fallback_text 缺省时用 build_lyrics_text(song, lyric, cfg.lyrics_max_lines) 现算，
-    它既是 mode="local" 的本地 Markdown 素材，也是最终纯文本兜底消息。
+    它既是 mode="local" 的本地纯文本素材，也是最终纯文本兜底消息。
     """
     config = ensure_runtime_config(cfg)
     lines = lyric_lines(lyric)
@@ -125,7 +126,7 @@ async def render_lyrics(
     lyric: Any,
     cfg: RuntimeConfig | Mapping[str, Any] | None = None,
 ) -> str | None:
-    """渲染歌词图：HTML -> Markdown -> None。
+    """渲染歌词图：HTML -> 纯文本图（兼容旧 Markdown 渲染器）-> None。
 
     返回图片 URL / 本地路径；任一环节失败都记日志并进入下一级，全部失败返回 None。
     """
@@ -147,12 +148,14 @@ async def render_lyrics(
     )
     if result:
         return result
-    logger.info("歌词 HTML 渲染未成功，降级为 Markdown 渲染。")
+    logger.info("歌词 HTML 渲染未成功，尝试安全文本图片。")
 
-    result = await call_renderer(
-        getattr(renderer, "render_markdown", None), text, options
-    )
+    result = await call_renderer(getattr(renderer, "render_text", None), text, options)
+    if not result:
+        result = await call_renderer(
+            getattr(renderer, "render_markdown", None), escape_markdown_text(text), options
+        )
     if result:
         return result
-    logger.warning("歌词渲染全部失败（HTML 与 Markdown 均未返回结果）。")
+    logger.warning("歌词渲染全部失败（HTML 与文本图片均未返回结果）。")
     return None

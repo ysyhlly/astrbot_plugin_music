@@ -104,7 +104,7 @@ HOT_COMMENTS = [
         "likedCount": 1000 + index,
         "time": 1580000000000,
     }
-    for index in range(1, 7)
+    for index in range(1, 11)
 ]
 NORMAL_COMMENTS = [
     {
@@ -188,26 +188,17 @@ async def mock_netease(overrides: dict[str, Any] | None = None):
         if request.path == PATH_SONG_URL:
             return web.json_response(AUDIO_PAYLOAD)
         if request.path == PATH_COMMENTS:
-            limit = max(1, int(request.query.get("limit", "20") or 20))
+            assert request.query["type"] == "0"
+            limit = max(1, int(request.query["pageSize"]))
+            offset = (max(1, int(request.query["pageNo"])) - 1) * limit
             sort_type = str(request.query.get("sortType", "2") or "2")
-            if sort_type == "3":  # 按时间排序：真实 API 只填 comments
-                payload = {
-                    "code": 200,
-                    "total": 42,
-                    "hotComments": [],
-                    "comments": NEW_COMMENTS[:limit],
-                    "more": True,
-                }
-            else:
-                hot = HOT_COMMENTS[:limit]
-                rest = NORMAL_COMMENTS[: max(0, limit - len(hot))]
-                payload = {
-                    "code": 200,
-                    "total": 42,
-                    "hotComments": hot,
-                    "comments": rest,
-                    "more": True,
-                }
+            pool = NEW_COMMENTS if sort_type == "3" else HOT_COMMENTS
+            comments = pool[offset:offset + limit]
+            payload = {"code": 200, "data": {
+                "totalCount": len(pool), "comments": comments,
+                "hasMore": offset + limit < len(pool),
+                "cursor": str(comments[-1]["time"]) if comments else "0",
+            }}
             return web.json_response(payload)
         return web.json_response({"code": 404, "msg": "not found"}, status=404)
 
@@ -449,11 +440,10 @@ async def test_comments_count_and_lyrics_max_lines_follow_config() -> None:
             )
     assert outcome.status == "ok"
     comment_call = next(call for call in calls if call["path"] == PATH_COMMENTS)
-    assert comment_call["params"]["limit"] == "8"
+    assert comment_call["params"]["pageSize"] == "8"
     assert len(renderer.html_calls[1]["data"]["items"]) == 8
     assert renderer.html_calls[0]["data"]["max_lines"] == 8
     html = render_template(renderer.html_calls[0]["template"], renderer.html_calls[0]["data"])
     assert html is not None
     assert html.count('<div class="line">') == LYRIC_LINES
     assert "仅显示前" not in html
-

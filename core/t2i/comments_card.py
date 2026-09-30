@@ -1,11 +1,10 @@
-"""网易云评论卡片渲染入口：HTML 模板 -> Markdown -> None 的三级降级。
+"""网易云评论卡片渲染入口：HTML 模板 -> 安全文本图 -> None 的降级链。
 
 与 lyrics_card 同构：
 
-- 自定义 HTML/Jinja2 模板只能走网络 t2i 端点，本地策略只支持 Markdown，
-  所以降级链固定为 HTML -> Markdown -> None；
+- 自定义 HTML/Jinja2 模板只能走网络 t2i 端点，本地使用 Pillow 绘制纯文本；
 - 数据里带 fallback_text，DefaultRenderer 在 mode="local" 时直接用它做本地
-  Markdown 渲染；
+  纯文本绘制；旧渲染器使用转义后的 Markdown；
 - 本模块不 import astrbot，只依赖 core.renderer.Renderer 协议。
 
 调用约定：
@@ -36,6 +35,7 @@ from .plain import (
 from .templates import (
     COMMENTS_TEMPLATE,
     call_renderer,
+    escape_markdown_text,
     is_template_renderable,
 )
 
@@ -151,7 +151,7 @@ async def render_comments(
     page: Any,
     cfg: RuntimeConfig | Mapping[str, Any] | None = None,
 ) -> str | None:
-    """渲染网易云评论图：HTML -> Markdown -> None。
+    """渲染评论图：HTML -> 纯文本图（兼容旧 Markdown 渲染器）-> None。
 
     返回图片 URL / 本地路径；没有可展示的评论或渲染全失败时返回 None。
     """
@@ -173,12 +173,14 @@ async def render_comments(
     )
     if result:
         return result
-    logger.info("评论 HTML 渲染未成功，降级为 Markdown 渲染。")
+    logger.info("评论 HTML 渲染未成功，尝试安全文本图片。")
 
-    result = await call_renderer(
-        getattr(renderer, "render_markdown", None), text, options
-    )
+    result = await call_renderer(getattr(renderer, "render_text", None), text, options)
+    if not result:
+        result = await call_renderer(
+            getattr(renderer, "render_markdown", None), escape_markdown_text(text), options
+        )
     if result:
         return result
-    logger.warning("评论渲染全部失败（HTML 与 Markdown 均未返回结果）。")
+    logger.warning("评论渲染全部失败（HTML 与文本图片均未返回结果）。")
     return None

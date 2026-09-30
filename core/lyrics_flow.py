@@ -131,6 +131,10 @@ class ViewportRenderer:
     async def render_markdown(self, md: str, options: RenderOptions | None = None) -> str | None:
         return await self._render("render_markdown", (md,), options)
 
+    async def render_text(self, text: str, options: RenderOptions | None = None) -> str | None:
+        """Forward the optional plain-text renderer without interpreting Markdown."""
+        return await self._render("render_text", (text,), options)
+
     # ------------------------------------------------------------------ 内部
 
     async def _render(self, name: str, args: tuple[Any, ...], options: Any) -> str | None:
@@ -280,8 +284,8 @@ async def run_lyrics_flow(
 
     - cfg.lyrics_enable=False：直接返回 None（**不发起任何取数调用**）；
     - 取不到歌词 / 歌词为空：status="empty"，按 lyrics_fallback_text 给提示；
-    - cfg.lyrics_t2i=False 或渲染失败：status="render_failed"，按
-      lyrics_fallback_text 给 build_lyrics_text 纯文本。
+    - cfg.lyrics_t2i=False：status="text"，发送明确选择的纯文本；
+    - 渲染失败：status="render_failed"，按 lyrics_fallback_text 给纯文本。
     """
     config = ensure_runtime_config(cfg)
     if not config.lyrics_enable:
@@ -297,6 +301,7 @@ async def run_lyrics_flow(
     if data is None or data.is_empty():
         return LyricsFlowResult(status="empty", text=_empty_message(config), lyric=data, fetched=fetched)
 
+    explicit_text = not config.lyrics_t2i
     if config.lyrics_t2i and renderer is not None:
         image = await _render_lyric_image(config, song, data, renderer)
         if image:
@@ -306,10 +311,12 @@ async def run_lyrics_flow(
         log_debug(config, "lyrics_t2i 关闭或没有渲染器，直接使用纯文本歌词。", logger=logger)
 
     text = ""
-    if config.lyrics_fallback_text:
+    if explicit_text or config.lyrics_fallback_text:
         try:
             text = build_lyrics_text(song, data, config.lyrics_max_lines) or ""
         except Exception as exc:  # pragma: no cover - 文本兜底异常
             logger.warning("生成歌词纯文本失败：%r", exc)
             text = ""
-    return LyricsFlowResult(status="render_failed", text=text, lyric=data, fetched=fetched)
+    return LyricsFlowResult(
+        status="text" if explicit_text else "render_failed", text=text, lyric=data, fetched=fetched
+    )

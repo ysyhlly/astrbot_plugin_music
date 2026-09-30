@@ -177,6 +177,7 @@ async def run_comments_flow(
     - cfg.comments_count=0：视为用户不要评论，status="disabled"，不取数；
     - provider 返回 None：status="fetch_failed" + 可读失败提示；
     - provider 返回空页：status="empty" + 「还没有评论」提示；
+    - cfg.comments_t2i=False：status="text"，发送明确选择的纯文本；
     - 渲染失败：status="render_failed" + build_comments_text 纯文本兜底。
     """
     config = ensure_runtime_config(cfg)
@@ -226,8 +227,11 @@ async def run_comments_flow(
         log_debug(config, "comments_t2i 关闭或没有渲染器，直接使用纯文本评论。", logger=logger)
 
     return CommentsFlowResult(
-        status="render_failed",
-        text=_fallback_text(config, song, data),
+        status="render_failed" if config.comments_t2i else "text",
+        text=(
+            _fallback_text(config, song, data) if config.comments_t2i
+            else build_comments_text(song, data, config)
+        ),
         page=data,
         total=data.total,
         shown=len(data.items),

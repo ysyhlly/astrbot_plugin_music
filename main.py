@@ -31,6 +31,8 @@ try:
     from astrbot.api import logger as astrbot_logger
     from astrbot.api.event import AstrMessageEvent, filter
     from astrbot.api.star import Context, Star, register
+    from astrbot.core.star.filter.command import CommandFilter
+    from astrbot.core.star.star_handler import star_handlers_registry
 except ImportError as exc:  # pragma: no cover - 只在 AstrBot 运行时可用
     raise ImportError(
         "点歌插件需要在 AstrBot (>=4.16,<5) 运行时中加载：当前环境无法导入 astrbot.api。"
@@ -187,7 +189,7 @@ def _alias_set(aliases: Iterable[Any] | None) -> set[str]:
     """可接受的指令名集合（配置别名 ∪ 静态注册别名，小写比较）。"""
     accepted = {alias.lower() for alias in DEFAULT_COMMAND_ALIASES}
     for alias in aliases or ():
-        text = _strip_invisible(_as_text(alias)).strip().lower()
+        text = _collapse(alias).lower()
         if text:
             accepted.add(text)
     return accepted
@@ -227,13 +229,16 @@ def parse_command_text(raw: Any, aliases: Iterable[Any] | None = None) -> Comman
 
     first, _, rest = stripped.partition(" ")
     command = ""
-    if first.lower() in accepted:
-        command = first
-    elif had_prefix:
+    for alias in sorted(accepted, key=len, reverse=True):
+        if stripped.lower() == alias or stripped.lower().startswith(f"{alias} "):
+            command = stripped[:len(alias)]
+            rest = stripped[len(alias):].strip()
+            break
+    if not command and had_prefix:
         # 唤醒前缀之后的第一个词就是指令名（例如用户自定义别名，AstrBot 已经匹配到本
         # handler，只是不在配置的别名表里）
         command = first
-    else:
+    elif not command:
         # 理论上 AstrBot 的 CommandFilter 已经过滤过；留一条可读提示兜底
         return CommandRequest(raw=text, error="not_command", message=MISSING_ARGUMENT_MESSAGE)
 
@@ -382,6 +387,7 @@ async def run_music_request(
     limiter: RateLimiter | None = None,
     rate_key: str = "",
     factory: Any = None,
+    platform_name: str | None = None,
 ) -> MusicRequestOutcome:
     """编排一次点歌：限额 → 选曲 → 卡片 → 歌词 → 评论。
 
@@ -401,6 +407,7 @@ async def run_music_request(
         factory=factory,
         limiter=limiter,
         rate_key=rate_key,
+        platform_name=platform_name,
     )
     if not outcome.card_phase_ok:
         return outcome
@@ -420,6 +427,7 @@ async def _run_card_phase(
     limiter: RateLimiter | None = None,
     rate_key: str = "",
     factory: Any = None,
+    platform_name: str | None = None,
 ) -> MusicRequestOutcome:
     """第一段：限额 → 选曲 → 卡片。返回时 messages 里只有卡片或前置错误。
 
@@ -459,7 +467,8 @@ async def _run_card_phase(
     # 1) 歌曲卡片（失败按 card_fallback 退化为 Share 或纯文本）
     try:
         card = await build_card_result(
-            song, config, provider=source, transport=transport, factory=factory
+            song, config, provider=source, transport=transport, factory=factory,
+            platform_name=platform_name,
         )
     except Exception as exc:  # pragma: no cover - 卡片层自身已兜底
         log_warning("卡片构造异常，改用纯文本：%r", exc, logger=logger)
@@ -499,6 +508,7 @@ async def _run_enrich_phase(
         return outcome
 
     # fallback_to_plain 是「全局纯文本兜底」总开关：关掉后渲染失败不再补发纯文本。
+    # 主动关闭 t2i 的文本输出以 status="text" 标记，不受兜底开关影响。
     # 注意与两个相邻开关的区别，勿混用：
     #   * card_fallback（share/text）是用户显式选择的「卡片形态」，因此不受本开关影响——
     #     用户主动选 text 就应该拿到文本；
@@ -529,14 +539,14 @@ async def _run_enrich_phase(
     if lyrics is not None:
         if lyrics.has_image:
             outcome.messages.append(("image", lyrics.image))
-        elif lyrics.has_text and plain_fallback:
+        elif lyrics.has_text and (lyrics.status == "text" or plain_fallback):
             outcome.messages.append(("text", lyrics.text))
 
     outcome.comments = comments
     if comments is not None:
         if comments.has_image:
             outcome.messages.append(("image", comments.image))
-        elif comments.has_text and plain_fallback:
+        elif comments.has_text and (comments.status == "text" or plain_fallback):
             outcome.messages.append(("text", comments.text))
 
     if not outcome.messages:
@@ -559,6 +569,7 @@ async def run_music_request_staged(
     limiter: RateLimiter | None = None,
     rate_key: str = "",
     factory: Any = None,
+    platform_name: str | None = None,
 ) -> AsyncGenerator[tuple[MusicRequestOutcome, list[tuple[str, Any]]], None]:
     """分段产出点歌结果：先给卡片，再给歌词/评论（顺序不变）。
 
@@ -583,6 +594,7 @@ async def run_music_request_staged(
         factory=factory,
         limiter=limiter,
         rate_key=rate_key,
+        platform_name=platform_name,
     )
     if not outcome.card_phase_ok:
         # 前置失败（限流 / 没搜到 / 无 provider）：一次性把该说的说了
@@ -649,7 +661,23 @@ class MusicPlugin(Star):
     def __init__(self, context: Context, config: Any = None) -> None:
         super().__init__(context)
         self.config: Any = config if config is not None else {}
-        self.rate_limiter = RateLimiter.from_config(ensure_runtime_config(self.config))
+        runtime = ensure_runtime_config(self.config)
+        self.rate_limiter = RateLimiter.from_config(runtime)
+        handler = star_handlers_registry.get_handler_by_full_name(
+            f"{self.cmd_song_request.__module__}_cmd_song_request"
+        )
+        self._command_filter: CommandFilter | None = None
+        if handler is not None:
+            for item in handler.event_filters:
+                if isinstance(item, CommandFilter):
+                    self._command_filter = item
+                    item.alias = {
+                        name for alias in runtime.command_aliases
+                        if (name := _collapse(alias)) and name != item.command_name
+                    }
+                    # CommandFilter caches the registered names before dispatch.
+                    item._cmpl_cmd_names = None
+                    break
 
     # ------------------------------------------------------------ 指令
 
@@ -678,9 +706,12 @@ class MusicPlugin(Star):
             _stop(event)
             return
 
+        aliases = config.command_aliases
+        if self._command_filter is not None:
+            aliases = self._command_filter.get_complete_command_names()
         request = parse_command_text(
             _event_text(event),
-            aliases=config.command_aliases,
+            aliases=aliases,
         )
         if not request.is_valid:
             yield event.plain_result(request.message or MISSING_ARGUMENT_MESSAGE)
@@ -703,6 +734,7 @@ class MusicPlugin(Star):
                     renderer=renderer,
                     limiter=limiter,
                     rate_key=rate_key,
+                    platform_name=_event_value(event, "get_platform_name") or None,
                 ):
                     messages = prepare_messages(
                         outcome,

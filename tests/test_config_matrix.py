@@ -59,13 +59,13 @@ from tests.conftest import require_astrbot  # noqa: E402
 
 @pytest.fixture(autouse=True)
 def _no_local_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
-    """把本地 Pillow 策略置为不可用，使渲染路径断言保持确定性。
+    """Isolate backend availability; real rendering has its own regression tests."""
+    async def unavailable(self, text, options):
+        return None
 
-    真实 AstrBot 在场时本地策略会先成功返回，令
-    「mode=local -> star.text_to_image」的断言失效（这正是性能修复点：
-    本地路径由 tests/test_renderer_default.py 专门验证）。
-    """
     monkeypatch.setattr(renderer_module, "local_render_strategy", lambda: None)
+    monkeypatch.setattr(renderer_module, "network_render_strategy", lambda: None)
+    monkeypatch.setattr(DefaultRenderer, "_render_via_local_text", unavailable)
 
 
 def _plugin_main():
@@ -87,15 +87,15 @@ MATRIX: list[tuple[str, str, str]] = [
     ("card_type(share)", "Share 组件与 Music 互斥", "share -> Share(url,title) 无 Music"),
     ("card_attach_audio", "是否附带 Record 组件", "True -> [Music, Record]；False -> [Music]"),
     ("lyrics_enable", "是否取歌词与是否产生消息", "False -> 不取数、返回 None；True -> 取数一次"),
-    ("lyrics_t2i", "图片消息 vs 纯文本消息", "True -> image；False -> text（render_failed）"),
-    ("lyrics_render_mode", "network/local/auto 的渲染路径", "html 成功 -> 网络图；html 失败 -> t2i 三级链回落本地 Markdown 图；Markdown 也失败 -> 纯文本"),
+    ("lyrics_t2i", "图片消息 vs 纯文本消息", "True -> image；False -> text"),
+    ("lyrics_render_mode", "network/local/auto 的渲染路径", "network只走网络；local只走本地；auto网络失败回落本地"),
     ("lyrics_max_lines", "模板 max_lines 与 HTML 行数", "4 -> 4 行 + 「仅显示前 4 行」；0/8 -> 全部 8 行"),
     ("lyrics_width", "注入 t2i 的 viewport_width", "900 -> 900；600 -> 600"),
     ("comments_enable", "是否取评论与是否产生消息", "False -> 不取数、返回 None；True -> 取数一次"),
     ("comments_count", "API limit 参数与模板 items 条数", "3 -> limit=3 + 3 条；8 -> limit=8 + 8 条"),
     ("comments_sort", "请求 sortType 与首条评论内容", "hot -> sortType=2 + 热门评论1；new -> sortType=3 + 最新评论1"),
     ("comments_max_chars", "评论正文截断", "3 -> 「热门评…」；0 -> 原文"),
-    ("comments_page", "请求 offset", "page=2 & count=3 -> offset=3"),
+    ("comments_page", "请求 pageNo/pageSize", "page=2 & count=3 -> pageNo=2、pageSize=3"),
     ("cooldown_seconds", "同 key 第二次调用是否被拒", "60 -> 拒绝（带剩余秒数）；0 -> 放行"),
     ("daily_limit", "第 N+1 次调用是否被拒", "2 -> 第 3 次拒绝；0 -> 不限次"),
     ("card_show_cover", "Music.image 是否有封面", "True -> 封面 URL；False -> 空"),
@@ -300,20 +300,17 @@ async def mock_netease(overrides: dict[str, Any] | None = None):
         if request.path == PATH_SONG_URL:
             return web.json_response(AUDIO_PAYLOAD)
         if request.path == PATH_COMMENTS:
-            limit = max(1, int(request.query.get("limit", "20") or 20))
-            offset = max(0, int(request.query.get("offset", "0") or 0))
+            assert request.query["type"] == "0"
+            limit = max(1, int(request.query["pageSize"]))
+            offset = (max(1, int(request.query["pageNo"])) - 1) * limit
             sort_type = str(request.query.get("sortType", "2") or "2")
-            if sort_type == "3":
-                payload = {"code": 200, "total": 42, "hotComments": [], "comments": NEW_COMMENTS[:limit], "more": True}
-            else:
-                pool = HOT_COMMENTS + NORMAL_COMMENTS
-                payload = {
-                    "code": 200,
-                    "total": 42,
-                    "hotComments": HOT_COMMENTS[max(0, offset) : offset + limit],
-                    "comments": NORMAL_COMMENTS[: max(0, limit - len(HOT_COMMENTS[max(0, offset) : offset + limit]))],
-                    "more": True,
-                }
+            pool = NEW_COMMENTS if sort_type == "3" else HOT_COMMENTS
+            comments = pool[offset:offset + limit]
+            payload = {"code": 200, "data": {
+                "totalCount": len(pool), "comments": comments,
+                "hasMore": offset + limit < len(pool),
+                "cursor": str(comments[-1]["time"]) if comments else "0",
+            }}
             return web.json_response(payload)
         return web.json_response({"code": 404, "msg": "not found"}, status=404)
 
@@ -482,16 +479,16 @@ async def test_lyrics_enable_toggles_fetch_and_message() -> None:
     assert on_provider.lyrics_calls == 1
 
 
-async def test_lyrics_t2i_false_falls_back_to_text() -> None:
+async def test_lyrics_t2i_false_selects_text() -> None:
     lyric = Lyric(text="第一句", lines=[LyricLine(text="第一句")])
     renderer = RecordingStar()
     result = await run_lyrics_flow(make_config(lyrics_t2i=False), make_song(), CountingProvider(lyric=lyric), None, DefaultRenderer(renderer))
-    assert result is not None and result.status == "render_failed"
+    assert result is not None and result.status == "text"
     assert result.has_image is False and result.has_text is True
     assert renderer.html_calls == [] and renderer.md_calls == []
 
 
-async def test_lyrics_render_mode_network_local_auto() -> None:
+async def test_lyrics_render_mode_network_local_auto(monkeypatch) -> None:
     lyric = Lyric(text="第一句", lines=[LyricLine(text="第一句")])
     song = make_song()
 
@@ -501,26 +498,39 @@ async def test_lyrics_render_mode_network_local_auto() -> None:
     assert network_ok is not None and network_ok.has_image
     assert star_ok.html_calls and star_ok.md_calls == []
 
-    # html 失败 -> core/t2i 三级链回落到本地 Markdown 图（Markdown 仍是图片，不是纯文本）
+    local_calls = []
+
+    async def local_image(self, text, options):
+        local_calls.append(options)
+        return "/tmp/config-matrix-local.png"
+
+    monkeypatch.setattr(DefaultRenderer, "_render_via_local_text", local_image)
+    # network must not enter a local backend even when one is available.
     star_fail = RecordingStar(html_result=None)
     fell_back = await run_lyrics_flow(make_config(lyrics_render_mode="network"), song, CountingProvider(lyric=lyric), None, DefaultRenderer(star_fail))
-    assert fell_back is not None and fell_back.has_image and fell_back.image
-    assert fell_back.image == star_fail.md_result
-    assert star_fail.html_calls and len(star_fail.md_calls) == 1
+    assert fell_back is not None and not fell_back.has_image and fell_back.has_text
+    assert star_fail.html_calls and star_fail.md_calls == []
+    assert local_calls == []
 
-    # mode=local：只走 text_to_image -> 出图
+    # local only uses the local literal-text backend.
     star_local = RecordingStar(html_result=None)
     local = await run_lyrics_flow(make_config(lyrics_render_mode="local"), song, CountingProvider(lyric=lyric), None, DefaultRenderer(star_local))
     assert local is not None and local.has_image
-    assert star_local.html_calls == [] and len(star_local.md_calls) == 1
+    assert star_local.html_calls == [] and star_local.md_calls == []
+    assert len(local_calls) == 1 and local_calls[-1].mode == "local"
 
-    # mode=auto：html 失败后用 Markdown 兜底
+    # auto uses local output after the HTML network attempt fails.
     star_auto = RecordingStar(html_result=None)
     auto = await run_lyrics_flow(make_config(lyrics_render_mode="auto"), song, CountingProvider(lyric=lyric), None, DefaultRenderer(star_auto))
     assert auto is not None and auto.has_image
-    assert len(star_auto.html_calls) == 1 and len(star_auto.md_calls) == 1
+    assert star_auto.html_calls and star_auto.md_calls == []
+    assert len(local_calls) == 2 and local_calls[-1].mode == "auto"
 
-    # html 与 Markdown 都失败 -> 渲染器返回 None，flows 才输出纯文本兜底
+    # No available backend leaves the existing plain-text fallback usable.
+    async def unavailable(self, text, options):
+        return None
+
+    monkeypatch.setattr(DefaultRenderer, "_render_via_local_text", unavailable)
     star_dead = RecordingStar(html_result=None, md_result=None)
     dead = await run_lyrics_flow(make_config(lyrics_render_mode="auto"), song, CountingProvider(lyric=lyric), None, DefaultRenderer(star_dead))
     assert dead is not None and dead.has_image is False and dead.has_text is True
@@ -582,7 +592,7 @@ async def test_comments_count_controls_limit_and_items() -> None:
             cfg = make_config(netease_api_base=base_url, comments_count=count)
             async with open_transport(base_url) as transport:
                 page = await NeteaseProvider(cfg).comments(make_song(), transport, limit=count)
-            assert calls[-1]["params"]["limit"] == str(count)
+            assert calls[-1]["params"]["pageSize"] == str(count)
             assert page is not None and len(page.items) == expected
 
 
@@ -615,7 +625,8 @@ async def test_comments_page_controls_offset() -> None:
         cfg = make_config(netease_api_base=base_url, comments_page=2, comments_count=3)
         async with open_transport(base_url) as transport:
             await NeteaseProvider(cfg).comments(make_song(), transport, limit=3, offset=3)
-    assert calls[-1]["params"]["offset"] == "3"
+    assert calls[-1]["params"]["pageNo"] == "2"
+    assert calls[-1]["params"]["pageSize"] == "3"
 
 
 # ---------------------------------------------------------------- 限流

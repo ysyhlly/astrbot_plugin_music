@@ -563,6 +563,9 @@ def parse_comments(
         data = _mapping(payload)
         if not data:
             return CommentPage()
+        nested = data.get("data")
+        if isinstance(nested, Mapping):
+            data = nested
         order = _text(sort).strip().lower()
         raws: list[Any] = []
         if order != "new":

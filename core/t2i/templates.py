@@ -39,6 +39,7 @@ __all__ = [
     "COMMENTS_TEMPLATE",
     "LYRICS_TEMPLATE",
     "call_renderer",
+    "escape_markdown_text",
     "get_environment",
     "is_template_renderable",
     "render_template",
@@ -346,3 +347,20 @@ async def call_renderer(method: Any, *args: Any, **kwargs: Any) -> str | None:
     if isinstance(result, str) and result.strip():
         return result.strip()
     return None
+
+
+def escape_markdown_text(text: str) -> str:
+    """Encode Markdown syntax before passing external text to a legacy renderer.
+
+    Entity decoding happens after Markdown block recognition in AstrBot, so an
+    external image marker cannot become an ImageBlock. Chat fallbacks continue
+    using the original plain text.
+
+    Args:
+        text: External lyrics, comments, and metadata.
+
+    Returns:
+        Markdown source displaying the original literal characters.
+    """
+    syntax = set("&<>\\`*_[]()!#|$~")
+    return "".join(f"&#{ord(char)};" if char in syntax else char for char in text)

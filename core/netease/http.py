@@ -258,19 +258,14 @@ class HttpTransport:
             "Accept": "application/json, text/plain, */*",
         }
         if self._cookie:
-            headers["Cookie"] = self._cookie
+            # 自建 API 的 Cookie parser 以「; 空白」拆分；兼容粘贴的紧凑 Cookie。
+            headers["Cookie"] = "; ".join(part.strip() for part in self._cookie.split(";") if part.strip())
         headers.update(self._extra_headers)
         return headers
 
     def build_url(self, path: Any) -> str:
         """把相对路径拼到 base_url 上（绝对 URL 原样返回）。"""
         return join_url(self._base_url, path)
-
-    def _cookie_param(self) -> dict[str, Any]:
-        """自建 API 支持用 cookie 查询参数注入登录态；官方直连走请求头。"""
-        if self._cookie and self._mode != MODE_OFFICIAL:
-            return {"cookie": self._cookie}
-        return {}
 
     def _ensure_session(self) -> Any:
         """惰性创建/复用 session（外部注入的 session 原样返回）。"""
@@ -349,11 +344,7 @@ class HttpTransport:
         url = self.build_url(text_path)
         verb = str(method or "GET").upper()
         query = _clean_params(params)
-        if not data:
-            query.update(self._cookie_param())
         body = _clean_params(data) if data else None
-        if body is not None:
-            body.update(self._cookie_param())
         verify_code = self._check_code if check_code is None else bool(check_code)
         per_request_timeout = _as_float(timeout, 0.0)
         attempt = 0
@@ -483,6 +474,8 @@ async def fetch_json(
     base_url: Any = "",
     timeout: Any = None,
     max_retries: Any = 0,
+    cookie: Any = "",
+    user_agent: Any = "",
 ) -> dict[str, Any] | None:
     """用任意 transport 执行一次接口请求，返回 JSON 对象（失败返回 None）。
 
@@ -543,6 +536,8 @@ async def fetch_json(
         base_url=base_url,
         timeout=timeout if timeout is not None else DEFAULT_TIMEOUT,
         max_retries=max_retries,
+        cookie=cookie,
+        user_agent=user_agent,
     )
     try:
         return await adapter.fetch(

@@ -3,7 +3,7 @@
 模式语义
 --------
 - self_hosted_api：自建 NeteaseCloudMusicApi（默认 http://127.0.0.1:3000），
-  路径为 /cloudsearch、/lyric、/comment/music、/song/detail、/song/url/v1，
+  路径为 /cloudsearch、/lyric、/comment/new、/song/detail、/song/url/v1，
   一律 GET + 查询参数。
 - official_direct：官方站点直连（https://music.163.com），路径为
   /api/cloudsearch/pc、/api/song/lyric、/api/v1/resource/comments/R_SO_4_<id>、
@@ -116,7 +116,7 @@ DEFAULT_MAX_RETRIES = 2
 PATH_SEARCH = "/cloudsearch"
 PATH_SEARCH_SIMPLE = "/search"
 PATH_LYRIC = "/lyric"
-PATH_COMMENTS = "/comment/music"
+PATH_COMMENTS = "/comment/new"
 PATH_SONG_DETAIL = "/song/detail"
 PATH_SONG_URL = "/song/url/v1"
 PATH_SONG_URL_LEGACY = "/song/url"
@@ -324,19 +324,28 @@ def build_comments_request(
     sort: Any = "hot",
     mode: Any = MODE_OFFICIAL,
     timeout: float | None = None,
+    cursor: Any = None,
 ) -> EndpointRequest:
-    """构造评论请求（自建 /comment/music 支持 sortType；官方只剩「推荐」序）。"""
+    """自建新版评论按页排序；最新页的 cursor 由 provider 用前页时间定位。"""
     count = max(1, min(_int(limit, 20), 100))
     start = max(0, _int(offset, 0))
     if is_self_hosted(mode):
+        sort_type = comment_sort_value(sort)
+        params = {
+            "id": _safe_id(song_id),
+            "type": 0,
+            "pageSize": count,
+            "pageNo": start // count + 1,
+            "sortType": sort_type,
+        }
+        if sort_type == 3:
+            if cursor is not None:
+                params["cursor"] = str(cursor)
+            elif start < count:
+                params["cursor"] = "0"
         return EndpointRequest(
             path=PATH_COMMENTS,
-            params={
-                "id": _safe_id(song_id),
-                "limit": count,
-                "offset": start,
-                "sortType": comment_sort_value(sort),
-            },
+            params=params,
             timeout=timeout,
         )
     return EndpointRequest(

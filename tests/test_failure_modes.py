@@ -117,10 +117,14 @@ EMPTY_SEARCH_PAYLOAD = {"code": 200, "result": {"songCount": 0, "songs": []}}
 LYRIC_PAYLOAD = {"code": 200, "lrc": {"lyric": "[00:00.00]第一句\n[00:03.00]第二句"}, "tlyric": {"lyric": ""}}
 COMMENTS_PAYLOAD = {
     "code": 200,
-    "total": 2,
-    "hotComments": [{"user": {"nickname": "小明"}, "content": "好听", "likedCount": 5, "time": 1580000000000}],
-    "comments": [{"user": {"nickname": "小红"}, "content": "循环", "likedCount": 1, "time": 1590000000000}],
-    "more": False,
+    "data": {
+        "totalCount": 2,
+        "comments": [
+            {"user": {"nickname": "小明"}, "content": "好听", "likedCount": 5, "time": 1580000000000},
+            {"user": {"nickname": "小红"}, "content": "循环", "likedCount": 1, "time": 1590000000000},
+        ],
+        "hasMore": False,
+    },
 }
 SONGS_BY_ID: dict[str, dict[str, Any]] = {
     "186016": {"id": 186016, "name": "晴天", "ar": [{"name": "周杰伦"}], "al": {"name": "叶惠美", "picUrl": COVER_URL}, "dt": 269000},
@@ -309,13 +313,13 @@ async def test_t2i_endpoint_500_falls_back_to_text(caplog: pytest.LogCaptureFixt
             result = await run_lyrics_flow(cfg, make_song(), None, None, renderer, lyric=lyric)
 
     assert result is not None and result.has_image is False and result.has_text is True
-    # 期望行为：带 viewport 失败 -> 去掉 viewport 重试一次（兼容性兜底）-> 仍失败 -> 纯文本
+    # HTML 卡片与安全文本图片各最多进行一次 viewport 兼容重试，之后发送纯文本。
     assert [call["path"] for call in calls] == ["/text2img/generate"] * len(posts)
-    assert 1 <= len(posts) <= 2, posts
-    assert "viewport_width" in posts[0] and "viewport_height" in posts[0]
-    if len(posts) == 2:
-        assert "viewport_width" not in posts[1] and "viewport_height" not in posts[1]
-    assert len(plugin_logs(caplog, logging.ERROR)) <= 3
+    assert len(posts) == 4, posts
+    for first, retry in zip(posts[::2], posts[1::2]):
+        assert "viewport_width" in first and "viewport_height" in first
+        assert "viewport_width" not in retry and "viewport_height" not in retry
+    assert len(plugin_logs(caplog, logging.ERROR)) <= 4
 
 
 async def test_viewport_rejection_is_cached_and_not_retried() -> None:
@@ -352,7 +356,7 @@ async def test_t2i_endpoint_without_id_falls_back_to_text() -> None:
         return web.json_response({"code": 0, "message": "success", "data": {}})
 
     async with mock_netease({"/text2img/generate": no_id}) as (base_url, _calls):
-        cfg = make_config(lyrics_t2i_endpoint=f"{base_url}/text2img")
+        cfg = make_config(lyrics_t2i_endpoint=f"{base_url}/text2img", lyrics_render_mode="network")
         result = await run_lyrics_flow(cfg, make_song(), None, None, DefaultRenderer(star=None), lyric=lyric)
     assert result is not None and result.has_image is False and result.has_text is True
 

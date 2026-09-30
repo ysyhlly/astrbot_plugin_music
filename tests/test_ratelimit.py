@@ -146,11 +146,19 @@ async def test_daily_counter_resets_on_new_day():
 
 async def test_daily_table_is_bounded():
     limiter, _ = make_limiter(daily_limit=5, max_keys=16)
+    decisions = []
     for index in range(200):
-        await limiter.check_and_consume(f"key-{index}")
+        decisions.append(await limiter.decide(f"key-{index}"))
+    assert all(state.allowed for state in decisions[:16])
+    assert all(not state.allowed and state.reason == "capacity" for state in decisions[16:])
+    # 已记录的 key 仍可使用剩余额度，满员不会重置其每日计数。
+    assert await limiter.remaining("key-0") == 4
+    for _ in range(4):
+        assert (await limiter.check_and_consume("key-0"))[0] is True
+    assert (await limiter.decide("key-0")).reason == "daily_limit"
     snapshot = limiter.snapshot()
-    assert snapshot["daily_keys"] <= 16
-    assert snapshot["tracked_keys"] <= 16
+    assert snapshot["daily_keys"] == 16
+    assert snapshot["tracked_keys"] == 16
 
 
 async def test_cooldown_table_is_bounded():
@@ -238,3 +246,110 @@ def test_build_key_variants():
 
 def test_default_max_keys_is_sane():
     assert DEFAULT_MAX_KEYS >= 64
+
+
+async def test_default_capacity_preserves_cooldown_and_daily_limit():
+    limiter, clock = make_limiter(cooldown_seconds=60, daily_limit=1)
+    assert (await limiter.check_and_consume("victim"))[0] is True
+    for index in range(DEFAULT_MAX_KEYS - 1):
+        assert (await limiter.check_and_consume(f"other-{index}"))[0] is True
+
+    # 第 4097 个 key 必须暂拒，而不是淘汰最早用户的有效限额。
+    crowded = await limiter.decide("overflow")
+    assert not crowded.allowed and crowded.reason == "capacity"
+    assert crowded.message and "稍后再试" in crowded.message
+    assert (await limiter.decide("victim")).reason == "cooldown"
+    clock.advance(60)
+    assert (await limiter.decide("victim")).reason == "daily_limit"
+    assert (await limiter.decide("overflow")).reason == "capacity"
+    assert await limiter.remaining("victim") == 0
+    assert limiter.snapshot()["tracked_keys"] == DEFAULT_MAX_KEYS
+    assert limiter.snapshot()["daily_keys"] == DEFAULT_MAX_KEYS
+
+
+async def test_cooldown_expiry_releases_capacity_on_same_day():
+    limiter, clock = make_limiter(cooldown_seconds=5, max_keys=16)
+    for index in range(16):
+        assert (await limiter.check_and_consume(f"key-{index}"))[0] is True
+    clock.advance(4.9)
+    assert (await limiter.decide("new")).reason == "capacity"
+    assert (await limiter.decide("key-0")).reason == "cooldown"
+    clock.advance(0.1)
+    assert (await limiter.check_and_consume("new"))[0] is True
+    assert (await limiter.check_and_consume("key-0"))[0] is True
+    assert limiter.snapshot()["tracked_keys"] == 2
+    assert limiter.snapshot()["daily_keys"] == 0
+
+
+async def test_existing_daily_key_can_use_remaining_quota_after_cooldown_at_capacity():
+    limiter, clock = make_limiter(cooldown_seconds=5, daily_limit=2, max_keys=16)
+    for index in range(16):
+        assert (await limiter.check_and_consume(f"key-{index}"))[0] is True
+    assert (await limiter.decide("new")).reason == "capacity"
+    clock.advance(5)
+    assert (await limiter.check_and_consume("key-0"))[0] is True
+    assert await limiter.remaining("key-0") == 0
+    clock.advance(5)
+    assert (await limiter.decide("key-0")).reason == "daily_limit"
+    assert (await limiter.decide("new")).reason == "capacity"
+    assert limiter.snapshot()["daily_keys"] == 16
+
+
+async def test_daily_rollover_releases_capacity():
+    limiter, clock = make_limiter(daily_limit=1, max_keys=16)
+    for index in range(16):
+        await limiter.check_and_consume(f"key-{index}")
+    assert (await limiter.decide("new")).reason == "capacity"
+    clock.set_day("2024-05-02", shift=0)
+    assert (await limiter.check_and_consume("new"))[0] is True
+    assert (await limiter.check_and_consume("key-0"))[0] is True
+    assert (await limiter.decide("key-0")).reason == "daily_limit"
+    assert limiter.snapshot()["daily_keys"] == 2
+
+
+async def test_daily_rollover_keeps_unexpired_cooldown_when_capacity_is_full():
+    limiter, clock = make_limiter(cooldown_seconds=60, daily_limit=1, max_keys=16)
+    for index in range(16):
+        await limiter.check_and_consume(f"key-{index}")
+    clock.set_day("2024-05-02", shift=0)
+    assert (await limiter.decide("new")).reason == "capacity"
+    assert (await limiter.decide("key-0")).reason == "cooldown"
+    clock.advance(60)
+    assert (await limiter.check_and_consume("new"))[0] is True
+    assert limiter.snapshot()["tracked_keys"] == 1
+    assert limiter.snapshot()["daily_keys"] == 1
+
+
+async def test_concurrent_new_keys_do_not_overfill_capacity_or_reset_quota():
+    limiter, _ = make_limiter(daily_limit=2, max_keys=16)
+    decisions = await asyncio.gather(*(limiter.decide(f"key-{index}") for index in range(80)))
+    accepted = [state.key for state in decisions if state.allowed]
+    assert len(accepted) == 16
+    assert all(state.allowed or state.reason == "capacity" for state in decisions)
+    second_round = await asyncio.gather(*(limiter.decide(key) for key in accepted))
+    assert all(state.allowed and state.remaining_today == 0 for state in second_round)
+    third_round = await asyncio.gather(*(limiter.decide(key) for key in accepted))
+    assert all(not state.allowed and state.reason == "daily_limit" for state in third_round)
+    assert limiter.snapshot()["tracked_keys"] == 16
+    assert limiter.snapshot()["daily_keys"] == 16
+
+
+async def test_disabled_limits_allow_more_than_capacity_without_storing_keys():
+    limiter, _ = make_limiter(max_keys=16)
+    decisions = await asyncio.gather(*(limiter.decide(f"key-{index}") for index in range(100)))
+    assert all(state.allowed for state in decisions)
+    assert limiter.snapshot()["tracked_keys"] == 0
+    assert limiter.snapshot()["daily_keys"] == 0
+
+
+async def test_disabling_limits_releases_previously_full_capacity():
+    limiter, _ = make_limiter(cooldown_seconds=60, daily_limit=1, max_keys=16)
+    for index in range(16):
+        await limiter.check_and_consume(f"key-{index}")
+    assert (await limiter.decide("new")).reason == "capacity"
+    limiter.cooldown_seconds = 0
+    limiter.daily_limit = 0
+    for index in range(40):
+        assert (await limiter.check_and_consume(f"new-{index}"))[0] is True
+    assert limiter.snapshot()["tracked_keys"] == 0
+    assert limiter.snapshot()["daily_keys"] == 0

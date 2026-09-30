@@ -12,7 +12,7 @@
       },
       "command_aliases": {
         "description": "指令别名列表",
-        "hint": "例如 [\"点歌\",\"听歌\",\"music\"]，每个别名都会注册成一条指令。",
+        "hint": "例如 [\"点歌\",\"听歌\",\"music\"]，保存并重载后注册生效；主指令点歌始终保留。",
         "type": "list",
         "default": ["点歌", "听歌", "music"]
       },
@@ -119,7 +119,7 @@
       },
       "fallback_to_plain": {
         "description": "失败时降级为纯文本",
-        "hint": "卡片/图片渲染失败时改为发送文本链接，避免整条消息丢失。",
+        "hint": "控制歌词/评论失败后的文本兜底；主动关闭图片输出或选择卡片文本形态不受此开关影响。",
         "type": "bool",
         "default": true
       }
@@ -138,7 +138,7 @@
       },
       "card_type": {
         "description": "卡片类型",
-        "hint": "163=网易云官方音乐卡片（需客户端支持）；custom=自定义音乐卡片；share=链接分享卡片（兼容性最好）。",
+        "hint": "OneBot 支持 163=网易云音乐卡片、custom=自定义音乐卡片、share=链接分享卡片；其他平台发送歌曲链接文本。",
         "type": "string",
         "default": "163",
         "options": ["163", "custom", "share"]
@@ -289,7 +289,7 @@
       },
       "comments_page": {
         "description": "评论页码",
-        "hint": "从第几页开始取评论，1 表示第一页。",
+        "hint": "从第几页开始取评论，1 表示第一页。最新评论首次定位最多补取20个前页，较深页需已有有效游标。",
         "type": "int",
         "default": 1
       },

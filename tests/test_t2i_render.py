@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import ast
 import asyncio
+from unittest.mock import AsyncMock
 from pathlib import Path
 from typing import Any
 
@@ -550,14 +551,16 @@ async def test_render_lyrics_tolerates_broken_renderer() -> None:
     assert await render_lyrics(BrokenRenderer(), make_song(), make_lyric(1), {}) is None
 
 
-async def test_render_lyrics_local_mode_uses_markdown_fallback_text() -> None:
+async def test_render_lyrics_local_mode_uses_literal_fallback_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    local = AsyncMock(return_value="local-lyrics.png")
+    monkeypatch.setattr(DefaultRenderer, "_render_via_local_text", local)
     star = FakeStar(text_result="local-lyrics.png")
     renderer = DefaultRenderer(star)
     cfg = RuntimeConfig.from_mapping({"lyrics_render_mode": "local"})
     result = await render_lyrics(renderer, make_song(), make_lyric(2), cfg)
     assert result == "local-lyrics.png"
-    assert len(star.text_calls) == 1
-    text = star.text_calls[0]["text"]
+    assert star.text_calls == []
+    text = local.call_args.args[0]
     assert TITLE in text
     assert "第1行歌词" in text
 
@@ -613,14 +616,17 @@ async def test_render_comments_returns_none_for_empty_page() -> None:
     assert await render_comments(None, make_song(), make_page(1), {}) is None
 
 
-async def test_render_comments_local_mode_uses_markdown_fallback_text() -> None:
+async def test_render_comments_local_mode_uses_literal_fallback_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    local = AsyncMock(return_value="local-comments.png")
+    monkeypatch.setattr(DefaultRenderer, "_render_via_local_text", local)
     star = FakeStar(text_result="local-comments.png")
     renderer = DefaultRenderer(star)
     result = await render_comments(
         renderer, make_song(), make_page(1), {"lyrics_render_mode": "local"}
     )
     assert result == "local-comments.png"
-    assert "评论正文1" in star.text_calls[0]["text"]
+    assert "评论正文1" in local.call_args.args[0]
+    assert star.text_calls == []
 
 
 # --------------------------------------------------------------------- 其他

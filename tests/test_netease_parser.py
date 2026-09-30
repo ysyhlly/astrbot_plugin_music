@@ -298,6 +298,8 @@ def test_build_other_requests_modes() -> None:
 
     comments = build_comments_request(186016, limit=10, offset=0, sort="hot", mode=MODE_SELF_HOSTED)
     assert comments.path == PATH_COMMENTS and comments.params["sortType"] == 2
+    assert comments.params["type"] == 0 and comments.params["pageSize"] == 10
+    assert comments.params["pageNo"] == 1 and "offset" not in comments.params
     assert build_comments_request(1, sort="new", mode=MODE_SELF_HOSTED).params["sortType"] == 3
     official_comments = build_comments_request(186016, mode=MODE_OFFICIAL)
     assert official_comments.path == "/api/v1/resource/comments/R_SO_4_186016"
@@ -709,7 +711,7 @@ async def test_get_json_success_and_headers() -> None:
     assert "Mozilla" in call["headers"]["User-Agent"]
     assert call["headers"]["Referer"] == "https://music.163.com/"
     assert call["headers"]["Cookie"] == "MUSIC_U=token"
-    assert call["params"]["cookie"] == "MUSIC_U=token"
+    assert "cookie" not in call["params"]
 
 
 async def test_post_json_sends_form_body() -> None:
@@ -984,7 +986,11 @@ async def test_provider_lyrics_missing_or_failed() -> None:
 
 
 async def test_provider_comments_hot_and_new() -> None:
-    async with mock_api({PATH_COMMENTS: (200, load(COMMENTS_JSON))}) as api:
+    old = load(COMMENTS_JSON)
+    hot_items = [item for item in old["hotComments"] + old["comments"] if item["content"]]
+    hot = {"code": 200, "data": {"comments": hot_items, "totalCount": 42, "hasMore": True}}
+    new = {"code": 200, "data": {"comments": old["comments"], "totalCount": 42, "hasMore": True}}
+    async with mock_api({PATH_COMMENTS: lambda index: (200, hot if index == 0 else new)}) as api:
         provider = NeteaseProvider(make_config(netease_api_base=api.base_url, comments_sort="hot", comments_max_chars=6))
         async with HttpTransport(base_url=api.base_url, mode=MODE_SELF_HOSTED, max_retries=0) as transport:
             page = await provider.comments(SongInfo(id="186016"), transport, limit=3)
@@ -996,7 +1002,7 @@ async def test_provider_comments_hot_and_new() -> None:
             assert len(new_page.items) == 2
             assert await provider.comments(SongInfo(id=""), transport) is None
     first = api.calls_of(PATH_COMMENTS)[0]["params"]
-    assert first["limit"] == "3" and first["sortType"] == "2" and first["offset"] == "0"
+    assert first["pageSize"] == "3" and first["sortType"] == "2" and first["pageNo"] == "1"
     assert api.calls_of(PATH_COMMENTS)[1]["params"]["sortType"] == "3"
 
 

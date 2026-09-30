@@ -5,8 +5,8 @@
 - RateLimiter.check_and_consume(key) -> (allowed, message)：
   允许时消费一次并返回 (True, None)；拒绝时返回 (False, 可读中文提示)；
 - cfg.cooldown_seconds=0 表示不限冷却，cfg.daily_limit=0 表示不限次数；
-- 计数表按日期清理（同一天才有意义），并在 key 数量超上限时做 FIFO 淘汰，
-  长时间运行内存有界；
+- 每日计数按日期清理，冷却状态过期后清理；达到 key 上限时暂拒新 key，
+  保留有效限额并保证长时间运行内存有界；
 - reset() 清空全部状态（测试用）；
 - 时钟与日期可注入（clock / today），单测不需要真的等待。
 """
@@ -36,7 +36,7 @@ __all__ = [
 ]
 
 DEFAULT_MAX_KEYS = 4096
-"""状态表最多保留多少个 key（超出按 FIFO 淘汰，保证内存有界）。"""
+"""最多保留多少个有效限额 key（容量不足时暂拒新 key）。"""
 
 
 def _as_int(value: Any, default: int = 0) -> int:
@@ -161,6 +161,7 @@ class RateLimiter:
         async with self._lock:
             self._roll_day()
             now = self._clock()
+            self._expire_state(now)
             state = RateLimitState(allowed=True, key=normalised)
             cooldown = self.cooldown_seconds
             if cooldown > 0:
@@ -185,12 +186,23 @@ class RateLimiter:
                 state.used_today = used
                 state.remaining_today = 0
                 return state
-            self._last_at[normalised] = now
+            active_keys = self._last_at.keys() | self._daily.keys()
+            if (
+                (cooldown > 0 or limit > 0)
+                and normalised not in active_keys
+                and len(active_keys) >= self.max_keys
+            ):
+                state.allowed = False
+                state.reason = "capacity"
+                state.message = "点歌服务繁忙，请稍后再试～"
+                state.remaining_today = self._remaining_locked(normalised)
+                return state
+            if cooldown > 0:
+                self._last_at[normalised] = now
             if limit > 0:
                 self._daily[normalised] = used + 1
             state.used_today = self._daily.get(normalised, 0)
             state.remaining_today = self._remaining_locked(normalised)
-            self._bound()
             return state
 
     async def remaining(self, key: Any = "") -> int:
@@ -215,7 +227,7 @@ class RateLimiter:
             "day": self._day,
             "cooldown_seconds": self.cooldown_seconds,
             "daily_limit": self.daily_limit,
-            "tracked_keys": len(self._last_at),
+            "tracked_keys": len(self._last_at.keys() | self._daily.keys()),
             "daily_keys": len(self._daily),
         }
 
@@ -248,15 +260,16 @@ class RateLimiter:
             return -1
         return max(0, self.daily_limit - self._daily.get(key, 0))
 
-    def _bound(self) -> None:
-        """状态表有界：冷却表按时间淘汰，计数表超限 FIFO 淘汰。"""
-        if len(self._last_at) > self.max_keys:
-            now = self._clock()
-            window = max(float(self.cooldown_seconds), 60.0)
-            stale = [key for key, at in self._last_at.items() if now - at > window]
+    def _expire_state(self, now: float) -> None:
+        """只释放不再需要的状态，不删除有效的冷却或当日计数。"""
+        if self.cooldown_seconds <= 0:
+            self._last_at.clear()
+        else:
+            stale = [
+                key for key, at in self._last_at.items()
+                if now - at >= self.cooldown_seconds
+            ]
             for key in stale:
                 self._last_at.pop(key, None)
-            while len(self._last_at) > self.max_keys:
-                self._last_at.pop(next(iter(self._last_at)), None)
-        while len(self._daily) > self.max_keys:
-            self._daily.pop(next(iter(self._daily)), None)
+        if self.daily_limit <= 0:
+            self._daily.clear()

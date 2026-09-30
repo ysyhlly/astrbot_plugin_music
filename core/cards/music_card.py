@@ -656,14 +656,25 @@ def build_card_result_from_payload(
     factory: Any = None,
     song: Any = None,
     card_type: Any = None,
+    platform_name: str | None = None,
 ) -> CardResult:
     """由载荷（+ 可选 SongInfo）构造卡片；同步、无 I/O、绝不抛异常。
 
     card_type 的决定顺序：显式 card_type 参数 > cfg.card_type > 载荷 type > 163。
     cfg 是用户的最终意图；provider 载荷里的 type 只是同一份配置的投影，
     两者不一致时以 cfg 为准并记 debug 日志。
+
+    platform_name 是事件的 PlatformMetadata.name；只有 aiocqhttp 支持 Music/Share。
+    明确传入其他平台时改发包含歌曲链接的 Plain，未传入时保留组件构造行为。
     """
     config = ensure_runtime_config(cfg)
+    if not bool(getattr(config, "card_enable", True)):
+        return CardResult(
+            requested_type=normalise_card_type(card_type)
+            or normalise_card_type(getattr(config, "card_type", ""))
+            or DEFAULT_CARD_TYPE,
+            reason="card_disabled",
+        )
     data: dict[str, Any] = dict(payload) if isinstance(payload, Mapping) else {}
     payload_type = normalise_card_type(data.get("type"))
     configured_type = normalise_card_type(getattr(config, "card_type", ""))
@@ -683,19 +694,6 @@ def build_card_result_from_payload(
     if bool(getattr(config, "card_show_cover", True)):
         image = _as_text(data.get("image")) or _field(song, "cover_url")
 
-    if not bool(getattr(config, "card_enable", True)):
-        # 用户关掉了卡片：不产出任何组件（调用方仍可用 text 兜底）
-        return CardResult(
-            components=[],
-            text="",
-            card_type="none",
-            requested_type=requested,
-            degraded=False,
-            reason="card_disabled",
-            audio_url=audio,
-            song_id=song_id,
-        )
-
     namespace = resolve_component_factory(factory)
     if namespace is None:
         # 没有可用组件（例如脱离 AstrBot 运行）：给出纯文本，绝不返回空组件链
@@ -707,6 +705,25 @@ def build_card_result_from_payload(
             requested_type=requested,
             degraded=True,
             reason="no_component_factory",
+            audio_url=audio,
+            song_id=song_id,
+        )
+
+    platform = _as_text(platform_name)
+    if platform and platform != "aiocqhttp":
+        text = build_card_text(
+            song,
+            payload={**data, "title": title, "url": url},
+            hint="当前平台不支持歌曲卡片，已改为链接文本",
+        )
+        plain = plain_component(text, namespace)
+        return CardResult(
+            components=[plain] if plain is not None else [],
+            text=text,
+            card_type="text" if plain is not None else "none",
+            requested_type=requested,
+            degraded=True,
+            reason=f"platform_unsupported:{platform}",
             audio_url=audio,
             song_id=song_id,
         )
@@ -837,6 +854,7 @@ async def build_card_result(
     factory: Any = None,
     card_type: Any = None,
     audio_url: Any = None,
+    platform_name: str | None = None,
 ) -> CardResult:
     """构造卡片（可能为了 music 卡片 / custom 去取一次播放地址）。
 
@@ -845,6 +863,13 @@ async def build_card_result(
     build_card_result_from_payload 按 cfg.card_fallback 退化。
     """
     config = ensure_runtime_config(cfg)
+    if not bool(getattr(config, "card_enable", True)):
+        return CardResult(
+            requested_type=normalise_card_type(card_type)
+            or normalise_card_type(getattr(config, "card_type", ""))
+            or DEFAULT_CARD_TYPE,
+            reason="card_disabled",
+        )
     data: dict[str, Any] = (
         dict(payload)
         if isinstance(payload, Mapping) and payload
@@ -857,11 +882,17 @@ async def build_card_result(
         or normalise_card_type(data.get("type"))
         or DEFAULT_CARD_TYPE
     )
-    if _needs_audio(config, requested, data.get("kind")) and not _as_text(data.get("audio")):
+    platform = _as_text(platform_name)
+    needs_audio = (not platform or platform == "aiocqhttp") and _needs_audio(
+        config, requested, data.get("kind")
+    )
+    if needs_audio and not _as_text(data.get("audio")):
         resolved = _as_text(audio_url) or await _resolve_audio_url(song, provider, transport)
         if resolved:
             data["audio"] = resolved
-    return build_card_result_from_payload(data, config, factory=factory, song=song, card_type=card_type)
+    return build_card_result_from_payload(
+        data, config, factory=factory, song=song, card_type=card_type, platform_name=platform_name
+    )
 
 
 async def build_card(
@@ -874,6 +905,7 @@ async def build_card(
     factory: Any = None,
     card_type: Any = None,
     audio_url: Any = None,
+    platform_name: str | None = None,
 ) -> list[Any]:
     """契约入口：返回可直接喂给 `event.chain_result` 的组件列表。
 
@@ -888,5 +920,6 @@ async def build_card(
         factory=factory,
         card_type=card_type,
         audio_url=audio_url,
+        platform_name=platform_name,
     )
     return list(result.components)

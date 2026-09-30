@@ -6,6 +6,7 @@ import logging
 import tempfile
 from pathlib import Path
 from typing import Any
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -21,13 +22,10 @@ from core.renderer import (
 
 @pytest.fixture(autouse=True)
 def _no_local_strategy(monkeypatch: pytest.MonkeyPatch) -> None:
-    """默认把「本地 Pillow 策略」置为不可用。
-
-    本文件多数用例断言的是 star 委派路径；若环境里恰好有真实 AstrBot
-    （tests/conftest.py 会注入 ASTRBOT_REF），本地策略会先成功返回，
-    让这些断言失去确定性。需要验证本地路径的用例自行覆盖本 fixture。
-    """
+    """Keep unit tests independent of the real framework's global backends."""
     monkeypatch.setattr(renderer_module, "local_render_strategy", lambda: None)
+    monkeypatch.setattr(renderer_module, "network_render_strategy", lambda: None)
+    monkeypatch.setattr(DefaultRenderer, "_render_via_local_text", AsyncMock(return_value=None))
 
 
 class FakeStar:
@@ -205,7 +203,7 @@ async def test_render_html_returns_none_for_empty_template() -> None:
 
 
 @pytest.mark.asyncio
-async def test_render_html_local_mode_uses_text_to_image() -> None:
+async def test_render_html_local_mode_does_not_use_star_when_local_unavailable() -> None:
     star = FakeStar(text_result="local.png")
     renderer = DefaultRenderer(star)
     result = await renderer.render_html(
@@ -213,11 +211,9 @@ async def test_render_html_local_mode_uses_text_to_image() -> None:
         {"title": "标题", "lines": [{"text": "第一行"}, {"text": "第二行"}]},
         RenderOptions(mode="local"),
     )
-    assert result == "local.png"
+    assert result is None
     assert star.html_calls == []
-    assert len(star.text_calls) == 1
-    text = star.text_calls[0]["text"]
-    assert "标题" in text and "第一行" in text and "第二行" in text
+    assert star.text_calls == []
 
 
 @pytest.mark.asyncio
@@ -231,13 +227,12 @@ async def test_render_html_local_mode_prefers_real_local_strategy(
     """
     calls: list[str] = []
 
-    class FakeLocalStrategy:
-        async def render(self, text: str, return_url: bool = True) -> str:
-            calls.append(text)
-            return "/tmp/local.png"
+    async def render_text(self, text: str, options: RenderOptions) -> str:
+        calls.append(text)
+        return "/tmp/local.png"
 
     monkeypatch.setattr(
-        renderer_module, "local_render_strategy", lambda: FakeLocalStrategy()
+        DefaultRenderer, "_render_via_local_text", render_text
     )
     star = FakeStar(text_result="network.png")
     renderer = DefaultRenderer(star)
@@ -250,46 +245,46 @@ async def test_render_html_local_mode_prefers_real_local_strategy(
 
 
 @pytest.mark.asyncio
-async def test_render_html_local_mode_falls_back_when_local_strategy_fails(
+async def test_render_html_local_mode_stops_when_local_strategy_fails(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    """本地策略抛异常时必须安全回退到 star 路径，绝不抛出。"""
+    """Local failure must never switch to the network."""
 
-    class BoomStrategy:
-        async def render(self, text: str, return_url: bool = True) -> str:
-            raise RuntimeError("pillow boom")
-
-    monkeypatch.setattr(
-        renderer_module, "local_render_strategy", lambda: BoomStrategy()
-    )
+    monkeypatch.setattr(DefaultRenderer, "_render_via_local_text", AsyncMock(return_value=None))
     star = FakeStar(text_result="fallback.png")
     renderer = DefaultRenderer(star)
     result = await renderer.render_html(
         "<div/>", {"fallback_text": "文本"}, RenderOptions(mode="local")
     )
-    assert result == "fallback.png"
-    assert len(star.text_calls) == 1
+    assert result is None
+    assert star.text_calls == []
 
 
 @pytest.mark.asyncio
-async def test_render_html_local_mode_prefers_fallback_text() -> None:
+async def test_render_html_local_mode_prefers_fallback_text(monkeypatch: pytest.MonkeyPatch) -> None:
+    local = AsyncMock(return_value="local.png")
+    monkeypatch.setattr(DefaultRenderer, "_render_via_local_text", local)
     star = FakeStar(text_result="local.png")
     renderer = DefaultRenderer(star)
     await renderer.render_html(
         "<div/>", {"fallback_text": "纯文本兜底"}, RenderOptions(mode="local")
     )
-    assert star.text_calls[0]["text"] == "纯文本兜底"
+    assert local.call_args.args[0] == "纯文本兜底"
+    assert star.text_calls == []
 
 
 @pytest.mark.asyncio
-async def test_render_html_auto_mode_falls_back_to_local() -> None:
+async def test_render_html_auto_mode_falls_back_to_local(monkeypatch: pytest.MonkeyPatch) -> None:
+    local = AsyncMock(return_value="local.png")
+    monkeypatch.setattr(DefaultRenderer, "_render_via_local_text", local)
     star = FakeStar(html_error=RuntimeError("network down"), text_result="local.png")
     renderer = DefaultRenderer(star)
     result = await renderer.render_html(
         "<div>{{ title }}</div>", {"title": "标题"}, RenderOptions(mode="auto")
     )
     assert result == "local.png"
-    assert star.html_calls and star.text_calls
+    assert star.html_calls and local.await_count == 1
+    assert star.text_calls == []
 
 
 @pytest.mark.asyncio
@@ -312,19 +307,24 @@ async def test_render_html_network_mode_never_falls_back_locally() -> None:
 
 
 @pytest.mark.asyncio
-async def test_render_markdown_returns_none_when_star_raises() -> None:
+async def test_render_markdown_returns_none_when_network_backend_raises(monkeypatch: pytest.MonkeyPatch) -> None:
+    strategy = type("Network", (), {"render": AsyncMock(side_effect=RuntimeError("boom"))})()
+    monkeypatch.setattr(renderer_module, "network_render_strategy", lambda: strategy)
     star = FakeStar(text_error=RuntimeError("boom"))
     renderer = DefaultRenderer(star)
-    assert await renderer.render_markdown("# 标题", RenderOptions(mode="local")) is None
+    assert await renderer.render_markdown("# 标题", RenderOptions(mode="network")) is None
 
 
 @pytest.mark.asyncio
-async def test_render_markdown_returns_string_on_success() -> None:
+async def test_render_markdown_returns_string_on_success(monkeypatch: pytest.MonkeyPatch) -> None:
+    strategy = type("Network", (), {"render": AsyncMock(return_value="https://img.example.com/md.png")})()
+    monkeypatch.setattr(renderer_module, "network_render_strategy", lambda: strategy)
     star = FakeStar(text_result="https://img.example.com/md.png")
     renderer = DefaultRenderer(star)
-    result = await renderer.render_markdown("# 标题", RenderOptions(mode="local"))
+    result = await renderer.render_markdown("# 标题", RenderOptions(mode="network"))
     assert result == "https://img.example.com/md.png"
-    assert star.text_calls[0]["text"] == "# 标题"
+    assert strategy.render.call_args.args[0] == "# 标题"
+    assert star.text_calls == []
 
 
 @pytest.mark.asyncio
@@ -431,7 +431,9 @@ async def test_endpoint_mode_writes_local_file_when_return_url_false() -> None:
 
 
 @pytest.mark.asyncio
-async def test_endpoint_failure_falls_back_to_local_in_auto_mode() -> None:
+async def test_endpoint_failure_falls_back_to_local_in_auto_mode(monkeypatch: pytest.MonkeyPatch) -> None:
+    local = AsyncMock(return_value="local.png")
+    monkeypatch.setattr(DefaultRenderer, "_render_via_local_text", local)
     star = FakeStar(html_error=RuntimeError("no star network"), text_result="local.png")
     renderer = DefaultRenderer(star)
     result = await renderer.render_html(
@@ -440,11 +442,12 @@ async def test_endpoint_failure_falls_back_to_local_in_auto_mode() -> None:
         RenderOptions(mode="auto", endpoint="http://127.0.0.1:1", timeout=0.5),
     )
     assert result == "local.png"
-    assert star.text_calls
+    assert local.await_count == 1 and star.text_calls == []
 
 
 @pytest.mark.asyncio
-async def test_local_mode_ignores_configured_endpoint() -> None:
+async def test_local_mode_ignores_configured_endpoint(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(DefaultRenderer, "_render_via_local_text", AsyncMock(return_value="local.png"))
     hits = {"count": 0}
 
     async def handler(request: Any) -> Any:

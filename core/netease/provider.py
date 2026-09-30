@@ -15,8 +15,12 @@ transport 兼容性（重要）
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import logging
+import time
+from collections import OrderedDict
 from collections.abc import Mapping
+from dataclasses import dataclass, field
 from typing import Any
 
 from ..config import RuntimeConfig, ensure_runtime_config
@@ -24,6 +28,7 @@ from ..models import CommentPage, Lyric, MusicQuery, SongInfo
 from ..provider import CardPayload, register_provider as register_to_registry
 from .endpoints import (
     MODE_OFFICIAL,
+    MODE_SELF_HOSTED,
     EndpointRequest,
     build_audio_request,
     build_comments_request,
@@ -58,6 +63,19 @@ DETAIL_BATCH = 10
 
 DEFAULT_COMMENT_LIMIT = 20
 """未配置时的评论条数。"""
+
+MAX_CURSOR_PREFETCH = 20
+"""冷启动最新分页最多预取的前页数，避免深页产生无界请求。"""
+CURSOR_CACHE_TTL = 120.0
+MAX_CURSOR_STREAMS = 64
+MAX_CURSOR_PAGES = 128
+
+
+@dataclass
+class _CommentCursorState:
+    cursors: dict[int, str] = field(default_factory=lambda: {1: "0"})
+    updated: float = 0.0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
 
 def _as_str(value: Any, default: str = "") -> str:
@@ -107,6 +125,7 @@ class NeteaseProvider:
         self._overrides: dict[str, Any] = {
             str(name): value for name, value in overrides.items() if value is not None
         }
+        self._comment_cursors: OrderedDict[tuple[str, str, str, int], _CommentCursorState] = OrderedDict()
 
     # ------------------------------------------------------------ 配置
 
@@ -152,6 +171,8 @@ class NeteaseProvider:
             "mode": self._mode_for(transport),
             "base_url": "" if isinstance(base, str) and base.strip() else self._cfg.netease_api_base,
             "max_retries": self._cfg.max_retries,
+            "cookie": self._cfg.cookie,
+            "user_agent": self._cfg.user_agent,
         }
 
     async def _fetch(self, transport: Any, request: EndpointRequest) -> dict[str, Any] | None:
@@ -163,6 +184,8 @@ class NeteaseProvider:
             mode=options["mode"],
             base_url=options["base_url"],
             max_retries=options["max_retries"],
+            cookie=options["cookie"],
+            user_agent=options["user_agent"],
         )
 
     @staticmethod
@@ -209,6 +232,119 @@ class NeteaseProvider:
     def _comment_max_chars(self) -> int:
         """评论正文字数上限（0 表示不截断）。"""
         return max(0, _as_int(self._option("comments_max_chars", self._cfg.comments_max_chars), 0))
+
+    def _cursor_state(self, song_id: str, count: int, transport: Any) -> _CommentCursorState:
+        """游标按主机、登录态、歌曲、页大小隔离；同一流串行更新。"""
+        base = str(getattr(transport, "base_url", "") or self._cfg.netease_api_base)
+        cookie = str(getattr(transport, "cookie", self._cfg.cookie) or "")
+        identity = hashlib.sha256(cookie.encode()).hexdigest()
+        key = (base, identity, song_id, count)
+        state = self._comment_cursors.get(key)
+        if state is None:
+            state = _CommentCursorState()
+            self._comment_cursors[key] = state
+        self._comment_cursors.move_to_end(key)
+        while len(self._comment_cursors) > MAX_CURSOR_STREAMS:
+            self._comment_cursors.popitem(last=False)
+        return state
+
+    @staticmethod
+    def _next_comment_cursor(data: Mapping[str, Any], raws: list[Any]) -> str | None:
+        """新版最新分页使用上一页末条的原始毫秒 time，而非格式化展示时间。"""
+        value = raws[-1].get("time") if raws and isinstance(raws[-1], Mapping) else None
+        for candidate in (value, data.get("cursor")):
+            text = str(candidate or "").strip()
+            if text.isdigit() and int(text) > 0:
+                return text
+        return None
+
+    async def _sorted_comment_page(
+        self, song_id: str, transport: Any, count: int, page: int, sort: str,
+        cursor: str | None = None,
+    ) -> tuple[dict[str, Any], list[Any], CommentPage] | None:
+        request = build_comments_request(
+            song_id, limit=count, offset=(page - 1) * count, sort=sort,
+            mode=MODE_SELF_HOSTED, timeout=self._cfg.api_timeout, cursor=cursor,
+        )
+        payload = await self._fetch(transport, request)
+        if payload is None:
+            return None
+        nested = payload.get("data")
+        data = dict(nested) if isinstance(nested, Mapping) else dict(payload)
+        raws = data.get("comments")
+        if not isinstance(raws, (list, tuple)):
+            logger.warning("新版评论响应缺少 comments 列表")
+            return None
+        parsed = parse_comments({"data": data}, sort="new", offset=(page - 1) * count)
+        return data, list(raws), parsed
+
+    async def _collect_sorted_comments(
+        self, song_id: str, transport: Any, count: int, start: int, sort: str,
+        cursors: dict[int, str],
+    ) -> CommentPage | None:
+        """保留 limit/offset 契约，非整页 offset 最多合并相邻两页再裁剪。"""
+        first_page, skip = divmod(start, count)
+        first_page += 1
+        last_page = (start + count - 1) // count + 1
+        combined: list[Any] = []
+        final_data: dict[str, Any] = {}
+        final_page = CommentPage()
+        for page in range(first_page, last_page + 1):
+            cursor = cursors.get(page) if sort == "new" else None
+            if sort == "new" and cursor is None:
+                logger.warning("最新评论第 %d 页缺少有效时间游标", page)
+                return None
+            fetched = await self._sorted_comment_page(song_id, transport, count, page, sort, cursor)
+            if fetched is None:
+                return None
+            final_data, raws, final_page = fetched
+            combined.extend(raws)
+            next_cursor = self._next_comment_cursor(final_data, raws)
+            if sort == "new" and next_cursor:
+                cursors[page + 1] = next_cursor
+            if not final_page.has_more:
+                break
+        final_data["comments"] = combined[skip:skip + count]
+        final_data["hasMore"] = final_page.has_more or len(combined) > skip + count
+        # 以当前新版响应的分页标记为准，避免残留 more 字段覆盖 hasMore。
+        final_data.pop("more", None)
+        return parse_comments({"data": final_data}, self._comment_max_chars(), sort="new", offset=start)
+
+    async def _self_hosted_comments(
+        self, song_id: str, transport: Any, count: int, start: int, sort: str,
+    ) -> CommentPage | None:
+        if sort == "hot":
+            return await self._collect_sorted_comments(song_id, transport, count, start, sort, {})
+        first_page = start // count + 1
+        state = self._cursor_state(song_id, count, transport)
+        async with state.lock:
+            if first_page == 1 or time.monotonic() - state.updated > CURSOR_CACHE_TTL:
+                cursors = {1: "0"}
+            else:
+                cursors = dict(state.cursors)
+            anchor = max(page for page in cursors if page <= first_page)
+            if first_page - anchor > MAX_CURSOR_PREFETCH:
+                logger.warning("最新评论第 %d 页尚无游标，首次定位最多预取 %d 页；请从较浅页连续翻页", first_page, MAX_CURSOR_PREFETCH)
+                return None
+            for page in range(anchor, first_page):
+                fetched = await self._sorted_comment_page(song_id, transport, count, page, "new", cursors[page])
+                if fetched is None:
+                    return None
+                data, raws, parsed = fetched
+                if not parsed.has_more:
+                    return CommentPage(total=parsed.total)
+                cursor = self._next_comment_cursor(data, raws)
+                if cursor is None:
+                    logger.warning("最新评论第 %d 页缺少末条时间，无法定位下一页", page)
+                    return None
+                cursors[page + 1] = cursor
+            result = await self._collect_sorted_comments(song_id, transport, count, start, "new", cursors)
+            if result is not None:
+                # 整次调用成功才提交，失败、取消与重试不会污染已有边界。
+                keep = sorted(cursors)[-(MAX_CURSOR_PAGES - 1):]
+                state.cursors = {1: "0", **{page: cursors[page] for page in keep}}
+                state.updated = time.monotonic()
+            return result
 
     # ------------------------------------------------------------ 协议方法
 
@@ -290,6 +426,8 @@ class NeteaseProvider:
             count = self._comment_limit(limit)
             start = max(0, _as_int(offset, 0))
             sort_key = self._comment_sort(sort)
+            if mode == MODE_SELF_HOSTED:
+                return await self._self_hosted_comments(song_id, transport, count, start, sort_key)
             request = build_comments_request(
                 song_id,
                 limit=count,

@@ -6,6 +6,8 @@
   （async，可能需要取一次播放地址），返回可直接放进 event.chain_result 的组件；
 - build_card_result(...) -> CardResult：需要降级原因、纯文本兜底或 song_id 时用它；
   CardResult.components 非空时发送组件链，为空时才发送 CardResult.text；
+- platform_name：传事件的 PlatformMetadata.name，aiocqhttp 使用原生 Music/Share，
+  其他平台发送包含歌曲链接的 Plain；省略时维持原有组件构造行为；
 - at_component(qq) / card_extra_components(...)：@ 组件与附加语音组件；
 - COMPONENT_FACTORY / resolve_component_factory：可注入的组件工厂
   （默认延迟 import astrbot.api.message_components），使卡片逻辑在没有 astrbot

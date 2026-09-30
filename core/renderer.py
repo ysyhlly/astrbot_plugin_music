@@ -5,17 +5,18 @@
   max_lines=0, endpoint="", mode="auto", timeout=15.0, return_url=True)
 - Renderer: async render_html(template, data, options) / async render_markdown(md, options)
   两者都返回 str | None，失败返回 None。
-- DefaultRenderer(star)：用 star.html_render(...) / star.text_to_image(...) 渲染，
+- DefaultRenderer(star)：用受控的网络接口或本地渲染，
   遵守 options.mode（network/local/auto），任何异常都记日志并返回 None，绝不抛出。
 
 mode 语义：
 - "network"：只走网络渲染（优先 options.endpoint 直连 t2i 服务，其次 star.html_render）；
-- "local"：只走本地渲染（star.text_to_image，用模板数据降级出的文本）；
+- "local"：只走本地渲染，不调用 Star.text_to_image 的隐式网络降级；
 - "auto"：先试网络，失败后用本地兜底。
 """
 
 from __future__ import annotations
 
+import asyncio
 import inspect
 import logging
 import tempfile
@@ -51,6 +52,20 @@ def local_render_strategy() -> Any:
         return None
     return getattr(html_renderer, "local_strategy", None)
 
+
+def network_render_strategy() -> Any:
+    """Return AstrBot's network-only backend.
+
+    Returns:
+        The configured network strategy, or None when unavailable.
+    """
+    try:
+        from astrbot.core import html_renderer
+    except Exception:
+        return None
+    return getattr(html_renderer, "network_strategy", None)
+
+
 RENDER_MODES: tuple[str, ...] = ("network", "local", "auto")
 """支持的渲染模式。"""
 
@@ -60,6 +75,14 @@ SCREENSHOT_OPTIONS: dict[str, Any] = {"full_page": True, "type": "jpeg", "qualit
 """透传给 t2i 服务的 Playwright screenshot 选项默认值。"""
 
 _MAX_FALLBACK_CHARS = 8000
+
+_TEXT_TEMPLATE = """<!DOCTYPE html><html><head><meta charset="utf-8" /></head>
+<body style="margin:0;padding:28px;background:{{ background }};color:{{ foreground }};
+box-sizing:border-box;width:{{ width }}px">
+<pre style="margin:0;white-space:pre-wrap;overflow-wrap:anywhere;
+font-family:'PingFang SC','Microsoft YaHei','Noto Sans CJK SC',sans-serif;
+font-size:{{ font_size }}px;line-height:{{ line_spacing }}">{{ text | e }}</pre>
+</body></html>"""
 
 
 def normalize_mode(mode: Any) -> str:
@@ -207,10 +230,10 @@ class Renderer(Protocol):
 
 
 class DefaultRenderer:
-    """基于 Star.html_render / Star.text_to_image 的安全渲染器。
+    """基于受控网络接口与本地 Pillow 的安全渲染器。
 
-    star 可以是任意鸭子类型对象（测试里用假对象即可）；为 None 或缺方法时
-    相应渲染路径直接返回 None。
+    star 可以是任意鸭子类型对象；为 None 或缺 html_render 时跳过网络 HTML。
+    本地纯文本绘制不依赖 Star，公开 Renderer 协议仍只有 HTML / Markdown 两个入口。
     """
 
     def __init__(self, star: Any = None, logger_: logging.Logger | None = None) -> None:
@@ -244,16 +267,7 @@ class DefaultRenderer:
                 if mode == "local":
                     self.logger.warning("本地渲染缺少可降级的文本内容，跳过渲染。")
                 return None
-            # mode="local" 时优先走真正的本地 Pillow 渲染。
-            # 注意：star.text_to_image 在 AstrBot 里最终会调到**网络**策略
-            # (HtmlRenderer.render_t2i -> network_strategy.render)，所以它并不是
-            # 本地渲染——实测网络一次 3~6s，而本地 Pillow 约 0.2s。local 模式若只依赖
-            # star.text_to_image，就等于没生效（渲染依然走网络、依旧慢）。
-            if mode == "local":
-                local = await self._render_via_local_strategy(text)
-                if local:
-                    return local
-            return await self._render_via_star_markdown(text, opts)
+            return await self._render_via_local_text(text, opts)
         except Exception as exc:  # 双保险：绝不上抛
             self.logger.error("render_html 渲染失败：%s", exc, exc_info=True)
             return None
@@ -263,20 +277,50 @@ class DefaultRenderer:
         md: str,
         options: RenderOptions | None = None,
     ) -> str | None:
-        """用 Star.text_to_image 渲染 Markdown；任何异常都吞掉并返回 None。"""
+        """Render intentional Markdown using only the selected backend."""
         try:
             opts = _as_options(options)
             if not isinstance(md, str) or not md.strip():
                 self.logger.warning("render_markdown 收到空文本，跳过渲染。")
                 return None
-            if normalize_mode(opts.mode) == "local":
-                local = await self._render_via_local_strategy(md)
-                if local:
-                    return local
-            return await self._render_via_star_markdown(md, opts)
+            if opts.mode in {"network", "auto"}:
+                result = await self._render_via_star_markdown(md, opts)
+                if result or opts.mode == "network":
+                    return result
+            return await self._render_via_local_strategy(md, opts)
         except Exception as exc:  # 双保险：绝不上抛
             self.logger.error("render_markdown 渲染失败：%s", exc, exc_info=True)
             return None
+
+    async def render_text(
+        self, text: str, options: RenderOptions | None = None
+    ) -> str | None:
+        """Render external content as literal text, without Markdown parsing.
+
+        Args:
+            text: Plain lyrics, comments, or metadata.
+            options: Rendering settings and backend selection.
+
+        Returns:
+            Image URL or local path, or None after a rendering failure.
+        """
+        if not isinstance(text, str) or not text.strip():
+            return None
+        opts = _as_options(options)
+        dark = opts.theme == "dark"
+        return await self.render_html(
+            _TEXT_TEMPLATE,
+            {
+                "text": text,
+                "fallback_text": text,
+                "width": opts.width,
+                "font_size": opts.font_size,
+                "line_spacing": opts.line_spacing,
+                "background": "#15171c" if dark else "#ffffff",
+                "foreground": "#e8eaed" if dark else "#22252a",
+            },
+            opts,
+        )
 
     # ------------------------------------------------------------------ 内部
 
@@ -299,13 +343,15 @@ class DefaultRenderer:
                 return_url=opts.return_url,
                 options=options,
             )
-            result = await result if inspect.isawaitable(result) else result
+            if inspect.isawaitable(result):
+                result = await asyncio.wait_for(result, opts.timeout)
         except TypeError as exc:
             # 兼容旧签名（没有 options 关键字参数）
             self.logger.debug("html_render 签名不兼容（%s），改用最小参数重试。", exc)
             try:
                 result = render(template, payload, return_url=opts.return_url)
-                result = await result if inspect.isawaitable(result) else result
+                if inspect.isawaitable(result):
+                    result = await asyncio.wait_for(result, opts.timeout)
             except Exception as retry_exc:
                 self.logger.error("star.html_render 渲染失败：%s", retry_exc)
                 return None
@@ -315,32 +361,37 @@ class DefaultRenderer:
         return _clean_result(result)
 
     async def _render_via_star_markdown(self, text: str, opts: RenderOptions) -> str | None:
-        star = self.star
-        convert = getattr(star, "text_to_image", None) if star is not None else None
+        # Star.text_to_image invokes HtmlRenderer.render_t2i, which catches network
+        # errors (including cancellation) and silently switches to Pillow.
+        strategy = network_render_strategy() if self.star is not None else None
+        convert = getattr(strategy, "render", None)
         if not callable(convert):
-            self.logger.debug("star 不支持 text_to_image，跳过本地/文本渲染。")
+            self.logger.debug("No controlled network Markdown renderer is available.")
             return None
         try:
-            result = convert(text, return_url=opts.return_url)
-            result = await result if inspect.isawaitable(result) else result
-        except TypeError as exc:
-            self.logger.debug("text_to_image 签名不兼容（%s），改用最小参数重试。", exc)
-            try:
-                result = convert(text)
-                result = await result if inspect.isawaitable(result) else result
-            except Exception as retry_exc:
-                self.logger.error("star.text_to_image 渲染失败：%s", retry_exc)
-                return None
+            kwargs: dict[str, Any] = {"return_url": opts.return_url}
+            get_config = getattr(self.star, "_get_context_config", None)
+            if callable(get_config):
+                config = get_config()
+                if hasattr(config, "get") and config.get("t2i_active_template"):
+                    kwargs["template_name"] = config.get("t2i_active_template")
+            result = convert(text, **kwargs)
+            if inspect.isawaitable(result):
+                result = await asyncio.wait_for(result, opts.timeout)
         except Exception as exc:
-            self.logger.error("star.text_to_image 渲染失败：%s", exc)
+            self.logger.error("Network Markdown rendering failed: %s", exc)
             return None
         return _clean_result(result)
 
-    async def _render_via_local_strategy(self, text: str) -> str | None:
-        """用 AstrBot 的本地 Pillow 策略渲染 Markdown（不联网，实测约 0.2s）。
+    async def _render_via_local_strategy(self, text: str, opts: RenderOptions) -> str | None:
+        """Render intentional Markdown with AstrBot's local-only backend.
 
-        这是 local 模式真正的本地实现：ImportError/属性缺失一律返回 None，
-        让调用方回退到 star.text_to_image。绝不抛出。
+        Args:
+            text: Markdown source from an intentional Markdown caller.
+            opts: Backend timeout settings.
+
+        Returns:
+            A local image path, or None if the local backend fails.
         """
         strategy = local_render_strategy()
         if strategy is None:
@@ -352,11 +403,65 @@ class DefaultRenderer:
             return None
         try:
             result = render(text, return_url=False)
-            result = await result if inspect.isawaitable(result) else result
+            if inspect.isawaitable(result):
+                result = await asyncio.wait_for(result, opts.timeout)
         except Exception as exc:
-            self.logger.warning("本地 Pillow 渲染失败，回退网络/文本路径：%s", exc)
+            self.logger.warning("Local Markdown rendering failed: %s", exc)
             return None
         return _clean_result(result)
+
+    async def _render_via_local_text(self, text: str, opts: RenderOptions) -> str | None:
+        """Draw literal text using AstrBot fonts and its temporary image directory.
+
+        Args:
+            text: Plain text. Markdown and HTML remain visible characters.
+            opts: Width, font, theme, line spacing, and timeout settings.
+
+        Returns:
+            Temporary image path, or None if local rendering fails.
+        """
+
+        def draw_text() -> str:
+            from PIL import Image, ImageDraw
+
+            from astrbot.core.utils.io import save_temp_img
+            from astrbot.core.utils.t2i.local_strategy import FontManager, TextMeasurer
+
+            font = FontManager.get_font(opts.font_size)
+            padding = min(28, opts.width // 4)
+            lines: list[str] = []
+            for line in text.splitlines():
+                lines.extend(
+                    TextMeasurer.split_text_to_fit_width(
+                        line, font, opts.width - padding * 2, preserve_whitespace=True
+                    )
+                )
+            _, glyph_height = TextMeasurer.get_text_size("Ag", font)
+            line_height = max(1, round(opts.font_size * opts.line_spacing))
+            height = padding * 2 + max(0, len(lines) - 1) * line_height + glyph_height
+            dark = opts.theme == "dark"
+            image = Image.new(
+                "RGB", (opts.width, height), "#15171c" if dark else "#ffffff"
+            )
+            try:
+                draw = ImageDraw.Draw(image)
+                for index, line in enumerate(lines):
+                    draw.text(
+                        (padding, padding + index * line_height),
+                        line,
+                        font=font,
+                        fill="#e8eaed" if dark else "#22252a",
+                        anchor="lt",
+                    )
+                return save_temp_img(image)
+            finally:
+                image.close()
+
+        try:
+            return await asyncio.wait_for(asyncio.to_thread(draw_text), opts.timeout)
+        except Exception as exc:
+            self.logger.warning("Local plain-text rendering failed: %s", exc)
+            return None
 
     async def _render_via_endpoint(
         self,

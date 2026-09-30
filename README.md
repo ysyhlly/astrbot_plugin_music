@@ -17,7 +17,8 @@
 ```
 
 - 歌词图与评论图走 AstrBot 的 **t2i（文转图）**，默认模板自包含、无需额外部署
-- 渲染服务不可用时**不会让指令失败**：三级降级 `HTML → Markdown → 纯文本`
+- 渲染服务不可用时**不会让指令失败**：依次尝试 `HTML 卡片 → 安全文本图片 → 纯文本`
+- 本地图片直接绘制歌词和评论文字，支持宽度、主题、字号与行距，不下载文字中的图片链接
 
 ---
 
@@ -64,7 +65,7 @@ AstrBot/
 | `/点歌 <歌名>` | 直接搜歌名 |
 | `/点歌 <歌名> <歌手>` | 歌手可选，**允许含空格**（`/点歌 晴天 周 杰 伦` 会当作歌手「周 杰 伦」） |
 
-别名默认 `点歌 / 听歌 / music`，可在 `basic.command_aliases` 改。
+别名默认 `点歌 / 听歌 / music`，可在 `basic.command_aliases` 改，保存并重载插件后生效。配置中的别名会实际注册到 AstrBot，主指令 `点歌` 始终保留。
 
 **找不到歌时**会回可读中文提示而不是静默失败。
 
@@ -100,13 +101,15 @@ AstrBot/
 | `cookie` | string | `""` | 网易云 Cookie（**密钥字段**，用于需要登录的接口） |
 | `fallback_to_plain` | bool | `true` | **全局纯文本兜底总开关**：关闭后歌词/评论渲染失败不再补发纯文本 |
 
-> `fallback_to_plain` 的作用范围（三者语义不同，勿混淆）：
+> `fallback_to_plain` 的作用范围：
 > - **受它控制**：歌词、评论渲染失败后的纯文本兜底；
+> - **不受它控制**：关闭 `lyrics_t2i` 或 `comments_t2i` 后主动选择的文本输出，也不受对应的 `*_fallback_text` 控制；
 > - **不受它控制**：`card_fallback`（`share`/`text`）是你**显式选择**的卡片形态——选了 `text` 就应该拿到文本；
 > - **不受它控制**：三个功能全关时那条「点到了什么」提示，它是防止**空消息链**的安全网（空链会被 AstrBot 出站环节整条跳过，你将什么都收不到）。
 
 > **官方直连的已知限制**：评论多数需要 Cookie 且无法按时间排序、无逐字歌词、旧搜索接口可能无封面、播放地址基本取不到。
 > 想要完整体验（封面 / 音频 / 按时间排序评论），建议自建 [NeteaseCloudMusicApi](https://github.com/Binaryify/NeteaseCloudMusicApi) 并把 `netease_mode` 设为 `self_hosted_api`、`netease_api_base` 填其地址。
+> Cookie 仅通过请求头传递，不会自动加入请求 URL。
 
 ### 3. 歌曲卡片 `card`
 
@@ -121,6 +124,7 @@ AstrBot/
 
 > `custom` 形态要求 `url`+`audio`+`title` 同时非空（AstrBot 的出站校验规则），否则组件会被丢弃。
 > 插件会自动尝试取音频直链，拿不到就按 `card_fallback` 降级，**不会出现「用户什么都收不到」**。
+> 原生音乐/分享卡片用于 OneBot（`aiocqhttp`）；WebChat、Telegram 等其他平台会发送曲名和歌曲链接。关闭 `card_enable` 后不再查询卡片播放地址。
 
 ### 4. 歌词图 `lyrics`
 
@@ -139,6 +143,8 @@ AstrBot/
 | `lyrics_show_meta` | bool | `true` | 显示曲名/歌手/专辑/时长 |
 | `lyrics_highlight_translation` | bool | `true` | 显示翻译副行 |
 | `lyrics_fallback_text` | bool | `true` | 渲染失败时退化为纯文本 |
+
+> `local` 仅使用本地文字绘制，`network` 仅调用网络渲染，`auto` 才会从网络回落本地。本地图片显示文字信息；封面、头像及自定义 HTML 布局由网络渲染提供。
 
 ### 5. 网易云评论 `comments`
 
@@ -160,6 +166,7 @@ AstrBot/
 | `comments_fallback_text` | bool | `true` | 渲染失败时退化为纯文本 |
 
 > **空评论 ≠ 获取失败**：请求成功但没有评论会提示「这首歌还没有评论」；请求失败才提示获取失败并引导配置自建 API / Cookie。
+> 自建 API 使用 `/comment/new`，需支持该接口。热门评论按页获取；最新评论使用上一页末条时间定位下一页。首次请求最多补取 20 个前页，超出且没有有效游标时会提示获取失败，可先选择较浅页；同一来源、登录态、歌曲与页大小的游标保留 120 秒。
 
 ### 6. 发送与调试 `send`
 
@@ -205,6 +212,8 @@ core/
   t2i/                 歌词与评论模板 + 渲染入口
 ```
 
+限流最多保留 4096 个有效用户/会话记录。容量已满时暂拒新的记录，已有冷却和当天限额继续有效；冷却过期或日期切换后释放相应容量。
+
 ---
 
 ## 开发与测试
@@ -221,7 +230,7 @@ py -3.12 -m pytest tests -q
 
 ## 常见问题
 
-**卡片没出现？** 检查 `card_enable`；若用 `custom`，官方直连通常拿不到音频直链，插件会按 `card_fallback` 降级为分享卡片。
+**卡片没出现？** 检查 `card_enable`；WebChat、Telegram 等平台会显示歌曲链接文本。OneBot 若用 `custom`，官方直连通常拿不到音频直链，插件会按 `card_fallback` 降级。
 
 **评论只有几条 / 拿不到？** 官方直连限制较多，建议自建 NeteaseCloudMusicApi 并填 `netease_api_base`。
 
