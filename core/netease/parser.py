@@ -556,7 +556,7 @@ def parse_comments(
     """解析评论响应为 CommentPage（无评论返回空页）。
 
     - sort="hot"：热门评论（hotComments）在前，再补普通评论，按 id 去重；
-      sort="new"：忽略 hotComments，只用 comments（即按时间序的列表）。
+      sort="new"：忽略 hotComments，只用端点返回的 comments 顺序。
     - max_chars > 0 时截断正文（超出加省略号）；空正文的条目直接丢弃。
     """
     try:

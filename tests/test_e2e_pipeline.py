@@ -370,6 +370,60 @@ async def test_music_without_type_is_rejected_by_real_validator() -> None:
 # ---------------------------------------------------------------- 2. 全链路
 
 
+@pytest.mark.parametrize("sort", ["hot", "new"])
+@pytest.mark.parametrize("page_number", [1, 2])
+async def test_user_api_catalog_delivers_classic_comments_in_staged_flow(sort, page_number):
+    """用户服务仅提供旧评论接口：真实编排仍发送选定页的评论文本。"""
+    async def catalog(request):
+        return web.json_response({
+            "code": 200,
+            "login": {"loggedIn": True},
+            "endpoints": [{"path": "/comment/music"}, {"path": "/comment/hot"}],
+        })
+
+    async def comments(request):
+        limit = int(request.query["limit"])
+        offset = int(request.query["offset"])
+        hot = request.path == "/comment/hot"
+        pool = HOT_COMMENTS if hot else NEW_COMMENTS
+        payload = {"code": 200, "total": len(pool)}
+        payload["hotComments" if hot else "comments"] = pool[offset:offset + limit]
+        payload["hasMore" if hot else "more"] = offset + limit < len(pool)
+        if not hot and offset == 0:
+            payload["hotComments"] = HOT_COMMENTS
+        return web.json_response(payload)
+
+    rules = {"/docs": catalog, "/comment/hot": comments, "/comment/music": comments}
+    main = _plugin_main()
+    messages = []
+    async with mock_netease(rules) as (base_url, calls):
+        cfg = make_config(
+            netease_api_base=base_url, lyrics_enable=False, comments_t2i=False,
+            comments_count=2, comments_page=page_number, comments_sort=sort,
+            fallback_to_plain=False, comments_fallback_text=False,
+        )
+        async with open_transport(base_url) as transport:
+            async for outcome, fresh in main.run_music_request_staged(
+                cfg, keyword="晴天", artist="周杰伦", provider=NeteaseProvider(cfg),
+                transport=transport, renderer=None, platform_name="webchat",
+            ):
+                messages.extend(fresh)
+
+    assert outcome.ok
+    assert [kind for kind, _ in messages] == ["chain", "text"]
+    assert outcome.comments.status == "text"
+    pool = HOT_COMMENTS if sort == "hot" else NEW_COMMENTS
+    selected = pool[(page_number - 1) * 2:page_number * 2]
+    assert [item.content for item in outcome.comments.page.items] == [item["content"] for item in selected]
+    assert all(item["content"] in messages[1][1] for item in selected)
+    assert PATH_COMMENTS not in [call["path"] for call in calls]
+    route = "/comment/hot" if sort == "hot" else "/comment/music"
+    request = next(call for call in calls if call["path"] == route)
+    assert request["params"]["limit"] == "2"
+    assert request["params"]["offset"] == str((page_number - 1) * 2)
+    assert "sortType" not in request["params"]
+
+
 async def test_end_to_end_self_hosted_full_chain() -> None:
     """搜索 → 歌词 → 评论 → 渲染 全链路（真实 provider + 真实传输层 + 本地 mock API）。"""
     main = _plugin_main()

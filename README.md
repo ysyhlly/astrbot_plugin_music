@@ -26,7 +26,7 @@
 
 ### 方式一：用安装包（推荐）
 
-`astrbot_plugin_music-v0.1.0.zip` 解压后**顶层就是 `astrbot_plugin_music/` 目录**，整目录放进 AstrBot 的 `data/plugins/`：
+`astrbot_plugin_music-v0.1.1.zip` 解压后**顶层就是 `astrbot_plugin_music/` 目录**，整目录放进 AstrBot 的 `data/plugins/`：
 
 ```
 AstrBot/
@@ -166,7 +166,8 @@ AstrBot/
 | `comments_fallback_text` | bool | `true` | 渲染失败时退化为纯文本 |
 
 > **空评论 ≠ 获取失败**：请求成功但没有评论会提示「这首歌还没有评论」；请求失败才提示获取失败并引导配置自建 API / Cookie。
-> 自建 API 使用 `/comment/new`，需支持该接口。热门评论按页获取；最新评论使用上一页末条时间定位下一页。首次请求最多补取 20 个前页，超出且没有有效游标时会提示获取失败，可先选择较浅页；同一来源、登录态、歌曲与页大小的游标保留 120 秒。
+> 自建 API 会自动识别评论接口。支持 `/comment/new` 时保留排序与时间游标分页；只提供旧接口时，热门评论使用 `/comment/hot`，普通评论使用 `/comment/music` 的 `comments` 列表，页码换算为 `limit`/`offset`。旧接口的评论顺序由上游决定，首页附带的热门列表不会混入普通评论。
+> 新版时间游标分页首次请求最多补取 20 个前页；旧接口直接按偏移量翻页，不受此限制。服务端已登录时可以留空插件 Cookie。
 
 ### 6. 发送与调试 `send`
 

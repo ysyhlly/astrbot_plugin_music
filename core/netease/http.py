@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from collections.abc import Mapping
+from dataclasses import dataclass
 from typing import Any
 
 import aiohttp
@@ -42,7 +43,9 @@ logger = logging.getLogger(__name__)
 __all__ = [
     "DEFAULT_RETRY_BACKOFF",
     "HttpTransport",
+    "HttpJsonResponse",
     "fetch_json",
+    "fetch_json_response",
 ]
 
 DEFAULT_RETRY_BACKOFF = 0.4
@@ -56,6 +59,14 @@ DEFAULT_RETRY_STATUSES: tuple[int, ...] = (500, 502, 503, 504)
 
 SUCCESS_CODES: tuple[int, ...] = (200,)
 """业务成功码（响应体里的 code 字段）。"""
+
+
+@dataclass(frozen=True)
+class HttpJsonResponse:
+    """一次调用的 JSON 与 HTTP 状态；网络失败或旧适配器的状态为 None。"""
+
+    payload: dict[str, Any] | None = None
+    status: int | None = None
 
 
 def _as_float(value: Any, default: float) -> float:
@@ -292,7 +303,7 @@ class HttpTransport:
         except Exception as exc:  # pragma: no cover - 极端情况下的等待失败
             logger.debug("退避等待异常：%s", exc)
 
-    async def _read_json(self, response: Any) -> dict[str, Any] | None:
+    async def _read_json(self, response: Any, *, quiet: bool = False) -> dict[str, Any] | None:
         """读取并校验 JSON 响应体（失败返回 None）。"""
         try:
             payload = await response.json(content_type=None)
@@ -303,10 +314,12 @@ class HttpTransport:
                 snippet = str(text or "")[:200]
             except Exception:  # pragma: no cover - body 已被消费
                 snippet = ""
-            logger.warning("响应不是合法 JSON（%s）：%s", exc, snippet)
+            if not quiet:
+                logger.warning("响应不是合法 JSON（%s）：%s", exc, snippet)
             return None
         if not isinstance(payload, Mapping):
-            logger.warning("响应 JSON 不是对象（%s），已忽略", type(payload).__name__)
+            if not quiet:
+                logger.warning("响应 JSON 不是对象（%s），已忽略", type(payload).__name__)
             return None
         return dict(payload)
 
@@ -337,16 +350,36 @@ class HttpTransport:
         check_code: bool | None = None,
     ) -> dict[str, Any] | None:
         """发起请求并返回 JSON 对象；任何失败都返回 None（不抛异常）。"""
+        result = await self.request_json_response(
+            method, path, params=params, data=data, timeout=timeout, check_code=check_code
+        )
+        return result.payload
+
+    async def request_json_response(
+        self,
+        method: Any,
+        path: Any,
+        *,
+        params: Any = None,
+        data: Any = None,
+        timeout: Any = None,
+        check_code: bool | None = None,
+        max_retries: Any = None,
+        quiet: bool = False,
+    ) -> HttpJsonResponse:
+        """保留每次调用的 HTTP 状态，供端点兼容判断；不改变旧 JSON 协议。"""
         text_path = str(path or "").strip()
         if not text_path:
-            logger.warning("请求路径为空，已忽略")
-            return None
+            if not quiet:
+                logger.warning("请求路径为空，已忽略")
+            return HttpJsonResponse()
         url = self.build_url(text_path)
         verb = str(method or "GET").upper()
         query = _clean_params(params)
         body = _clean_params(data) if data else None
         verify_code = self._check_code if check_code is None else bool(check_code)
         per_request_timeout = _as_float(timeout, 0.0)
+        retry_limit = self._max_retries if max_retries is None else max(0, _as_int(max_retries, 0))
         attempt = 0
         while True:
             try:
@@ -360,26 +393,31 @@ class HttpTransport:
                     kwargs["timeout"] = aiohttp.ClientTimeout(total=per_request_timeout)
                 async with session.request(verb, url, **kwargs) as response:
                     status = _as_int(getattr(response, "status", 0), 0)
-                    if status in self._retry_statuses and attempt < self._max_retries:
+                    if status in self._retry_statuses and attempt < retry_limit:
                         attempt += 1
                         await self._backoff(attempt - 1)
                         continue
                     if not 200 <= status < 300:
-                        logger.warning("请求 %s %s 返回 HTTP %s，已放弃", verb, url, status)
-                        return None
-                    payload = await self._read_json(response)
+                        if not quiet:
+                            logger.warning("请求 %s %s 返回 HTTP %s，已放弃", verb, url, status)
+                        return HttpJsonResponse(status=status)
+                    payload = await self._read_json(response, quiet=quiet)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:
-                if attempt < self._max_retries:
+                error_status = (exc.status or None) if isinstance(exc, aiohttp.ClientResponseError) else None
+                retryable = error_status is None or error_status in self._retry_statuses
+                if retryable and attempt < retry_limit:
                     attempt += 1
                     await self._backoff(attempt - 1)
                     continue
-                logger.warning("请求 %s %s 失败：%r", verb, url, exc)
-                return None
+                if not quiet:
+                    logger.warning("请求 %s %s 失败：%r", verb, url, exc)
+                return HttpJsonResponse(status=error_status or None)
             if payload is None:
-                return None
-            return self._validate_code(payload) if verify_code else payload
+                return HttpJsonResponse(status=status)
+            checked = self._validate_code(payload) if verify_code else payload
+            return HttpJsonResponse(payload=checked, status=status)
 
     async def get_json(
         self,
@@ -420,6 +458,20 @@ class HttpTransport:
             params=parsed.params,
             data=parsed.data,
             timeout=parsed.timeout,
+        )
+
+    async def fetch_response(
+        self, request: Any, *, max_retries: Any = None,
+        check_code: bool | None = None, quiet: bool = False,
+    ) -> HttpJsonResponse:
+        """执行端点请求并返回独立状态，避免并发请求共用最后状态。"""
+        parsed = _coerce_request(request)
+        if parsed is None:
+            return HttpJsonResponse()
+        return await self.request_json_response(
+            parsed.method or "GET", parsed.path, params=parsed.params,
+            data=parsed.data, timeout=parsed.timeout, max_retries=max_retries,
+            check_code=check_code, quiet=quiet,
         )
 
     async def close(self) -> None:
@@ -554,3 +606,61 @@ async def fetch_json(
     except Exception as exc:
         logger.warning("裸 session 请求失败：%r", exc)
         return None
+
+
+async def fetch_json_response(
+    transport: Any,
+    request: Any,
+    *,
+    mode: Any = "",
+    base_url: Any = "",
+    timeout: Any = None,
+    max_retries: Any = 0,
+    cookie: Any = "",
+    user_agent: Any = "",
+    max_retries_override: Any = None,
+    check_code: bool | None = None,
+    quiet: bool = False,
+) -> HttpJsonResponse:
+    """状态感知的适配入口；旧 fetch/get_json 适配器仍可用，状态保持未知。"""
+    parsed = _coerce_request(request)
+    if transport is None or parsed is None:
+        return HttpJsonResponse()
+    fetch_response = getattr(transport, "fetch_response", None)
+    if callable(fetch_response):
+        try:
+            result = await fetch_response(
+                parsed, max_retries=max_retries_override, check_code=check_code, quiet=quiet
+            )
+            return result if isinstance(result, HttpJsonResponse) else HttpJsonResponse()
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            if not quiet:
+                logger.warning("transport.fetch_response 失败：%r", exc)
+            return HttpJsonResponse()
+    if any(callable(getattr(transport, name, None)) for name in ("fetch", "request_json", "get_json")):
+        payload = await fetch_json(
+            transport, parsed, mode=mode, base_url=base_url, timeout=timeout,
+            max_retries=max_retries, cookie=cookie, user_agent=user_agent,
+        )
+        if isinstance(payload, Mapping):
+            payload = dict(payload)
+            if check_code is not False:
+                payload = HttpTransport._validate_code(payload)
+        else:
+            payload = None
+        return HttpJsonResponse(payload=payload)
+    adapter = HttpTransport(
+        session=transport,
+        mode=normalise_mode(mode) if str(mode or "").strip() else MODE_OFFICIAL,
+        base_url=base_url, timeout=timeout if timeout is not None else DEFAULT_TIMEOUT,
+        max_retries=max_retries, cookie=cookie, user_agent=user_agent,
+    )
+    return await adapter.fetch_response(
+        EndpointRequest(
+            path=parsed.path, params=parsed.params, method=parsed.method,
+            data=parsed.data, timeout=parsed.timeout or timeout,
+        ),
+        max_retries=max_retries_override, check_code=check_code, quiet=quiet,
+    )

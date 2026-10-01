@@ -52,6 +52,8 @@ __all__ = [
     "OFFICIAL_PATH_SONG_URL",
     "OFFICIAL_REFERER",
     "PATH_COMMENTS",
+    "PATH_COMMENTS_HOT",
+    "PATH_COMMENTS_MUSIC",
     "PATH_LYRIC",
     "PATH_SEARCH",
     "PATH_SEARCH_SIMPLE",
@@ -62,6 +64,7 @@ __all__ = [
     "EndpointRequest",
     "build_audio_request",
     "build_comments_request",
+    "build_classic_comments_request",
     "build_detail_request",
     "build_lyric_request",
     "build_search_request",
@@ -117,6 +120,8 @@ PATH_SEARCH = "/cloudsearch"
 PATH_SEARCH_SIMPLE = "/search"
 PATH_LYRIC = "/lyric"
 PATH_COMMENTS = "/comment/new"
+PATH_COMMENTS_HOT = "/comment/hot"
+PATH_COMMENTS_MUSIC = "/comment/music"
 PATH_SONG_DETAIL = "/song/detail"
 PATH_SONG_URL = "/song/url/v1"
 PATH_SONG_URL_LEGACY = "/song/url"
@@ -352,6 +357,29 @@ def build_comments_request(
         path=OFFICIAL_COMMENT_PATH_TEMPLATE.format(song_id=_safe_id(song_id)),
         params={"limit": count, "offset": start},
         timeout=timeout,
+    )
+
+
+def build_classic_comments_request(
+    song_id: Any,
+    *,
+    limit: int = 20,
+    offset: int = 0,
+    sort: Any = "hot",
+    timeout: float | None = None,
+) -> EndpointRequest:
+    """旧服务用专用热门端点与普通评论 offset；不假定 sortType 语义。"""
+    params: dict[str, Any] = {
+        "id": _safe_id(song_id),
+        "limit": max(1, min(_int(limit, 20), 100)),
+        "offset": max(0, _int(offset, 0)),
+    }
+    hot = str(sort or "").strip().lower() != "new"
+    if hot:
+        params["type"] = 0
+    return EndpointRequest(
+        path=PATH_COMMENTS_HOT if hot else PATH_COMMENTS_MUSIC,
+        params=params, timeout=timeout,
     )
 
 

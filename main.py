@@ -84,7 +84,7 @@ logger = get_logger("main")
 PLUGIN_NAME = "astrbot_plugin_music"
 PLUGIN_AUTHOR = "ysyhlly"
 PLUGIN_DISPLAY_NAME = "点歌"
-PLUGIN_VERSION = "v0.1.0"
+PLUGIN_VERSION = "v0.1.1"
 PLUGIN_REPO = "https://github.com/ysyhlly/astrbot_plugin_music"
 PLUGIN_DESC = "网易云点歌：/点歌 歌名 [歌手]，发送歌曲卡片、歌词图与评论图。"
 

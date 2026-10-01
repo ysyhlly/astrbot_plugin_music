@@ -169,6 +169,13 @@ class SortedApi:
 async def sorted_api():
     api = SortedApi()
     app = web.Application()
+
+    async def docs(request):
+        return web.json_response({
+            "code": 200, "endpoints": [{"path": "/comment/new"}],
+        })
+
+    app.router.add_get("/docs", docs)
     app.router.add_get("/comment/new", api.handle)
     async with TestServer(app, host="127.0.0.1") as server:
         api.base_url = str(server.make_url("/")).rstrip("/")

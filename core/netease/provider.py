@@ -29,16 +29,21 @@ from ..provider import CardPayload, register_provider as register_to_registry
 from .endpoints import (
     MODE_OFFICIAL,
     MODE_SELF_HOSTED,
+    PATH_COMMENTS,
+    PATH_COMMENTS_HOT,
+    PATH_COMMENTS_MUSIC,
     EndpointRequest,
     build_audio_request,
     build_comments_request,
+    build_classic_comments_request,
     build_detail_request,
     build_lyric_request,
     build_search_request,
     normalise_mode,
+    normalise_base_url,
     song_web_url,
 )
-from .http import HttpTransport, fetch_json
+from .http import HttpJsonResponse, HttpTransport, fetch_json, fetch_json_response
 from .parser import (
     extract_songs,
     parse_comments,
@@ -69,6 +74,9 @@ MAX_CURSOR_PREFETCH = 20
 CURSOR_CACHE_TTL = 120.0
 MAX_CURSOR_STREAMS = 64
 MAX_CURSOR_PAGES = 128
+COMMENT_API_CACHE_TTL = 120.0
+"""自建评论端点能力短缓存，按来源与登录态隔离。"""
+UNSUPPORTED_ENDPOINT_STATUSES = {404, 405, 501}
 
 
 @dataclass
@@ -76,6 +84,19 @@ class _CommentCursorState:
     cursors: dict[int, str] = field(default_factory=lambda: {1: "0"})
     updated: float = 0.0
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+@dataclass
+class _CommentApiState:
+    routes: dict[str, str] = field(default_factory=dict)
+    modern_confirmed: bool = False
+    updated: float = 0.0
+    generation: int = 0
+    lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+
+
+class _UnsupportedCommentEndpoint(Exception):
+    """仅实际 HTTP 404/405/501 表示可以切换端点协议。"""
 
 
 def _as_str(value: Any, default: str = "") -> str:
@@ -126,6 +147,7 @@ class NeteaseProvider:
             str(name): value for name, value in overrides.items() if value is not None
         }
         self._comment_cursors: OrderedDict[tuple[str, str, str, int], _CommentCursorState] = OrderedDict()
+        self._comment_apis: OrderedDict[tuple[str, str], _CommentApiState] = OrderedDict()
 
     # ------------------------------------------------------------ 配置
 
@@ -188,6 +210,15 @@ class NeteaseProvider:
             user_agent=options["user_agent"],
         )
 
+    async def _fetch_response(
+        self, transport: Any, request: EndpointRequest, *, probe: bool = False,
+    ) -> HttpJsonResponse:
+        options = self._adapter_options(transport)
+        return await fetch_json_response(
+            transport, request, **options, max_retries_override=0 if probe else None,
+            check_code=False if probe else None, quiet=probe,
+        )
+
     @staticmethod
     def _song_id(song: Any) -> str:
         """从 SongInfo / 映射 / 字符串里取歌曲 id。"""
@@ -233,12 +264,32 @@ class NeteaseProvider:
         """评论正文字数上限（0 表示不截断）。"""
         return max(0, _as_int(self._option("comments_max_chars", self._cfg.comments_max_chars), 0))
 
+    def _source_identity(self, transport: Any) -> tuple[str, str]:
+        base = normalise_base_url(
+            getattr(transport, "base_url", "") or self._cfg.netease_api_base,
+            mode=MODE_SELF_HOSTED,
+        )
+        cookie = str(getattr(transport, "cookie", self._cfg.cookie) or "")
+        if isinstance(transport, HttpTransport):
+            for name, value in transport.default_headers().items():
+                if name.lower() == "cookie":
+                    cookie = str(value)
+            session = transport.session
+        else:
+            session = transport
+            if not cookie:
+                headers = getattr(session, "headers", {})
+                if isinstance(headers, Mapping):
+                    cookie = str(headers.get("Cookie", ""))
+        # 裸 session 的登录 Cookie 也会随会话变化，避免共享不同登录态的缓存。
+        jar = getattr(session, "cookie_jar", None)
+        if jar is not None:
+            cookie += repr(sorted((item["domain"], item["path"], item.key, item.value) for item in jar))
+        return base, hashlib.sha256(cookie.encode()).hexdigest()
+
     def _cursor_state(self, song_id: str, count: int, transport: Any) -> _CommentCursorState:
         """游标按主机、登录态、歌曲、页大小隔离；同一流串行更新。"""
-        base = str(getattr(transport, "base_url", "") or self._cfg.netease_api_base)
-        cookie = str(getattr(transport, "cookie", self._cfg.cookie) or "")
-        identity = hashlib.sha256(cookie.encode()).hexdigest()
-        key = (base, identity, song_id, count)
+        key = (*self._source_identity(transport), song_id, count)
         state = self._comment_cursors.get(key)
         if state is None:
             state = _CommentCursorState()
@@ -246,6 +297,56 @@ class NeteaseProvider:
         self._comment_cursors.move_to_end(key)
         while len(self._comment_cursors) > MAX_CURSOR_STREAMS:
             self._comment_cursors.popitem(last=False)
+        return state
+
+    @staticmethod
+    def _documented_comment_routes(payload: Any) -> set[str] | None:
+        """仅信任 JSON 文档的明确 endpoint 清单，不从 HTML 或描述文字猜测。"""
+        if not isinstance(payload, Mapping):
+            return None
+        if payload.get("code", 200) not in (200, "200"):
+            return None
+        endpoints = payload.get("endpoints")
+        if not isinstance(endpoints, (list, tuple)) or not endpoints:
+            return None
+        paths: set[str] = set()
+        for endpoint in endpoints:
+            if isinstance(endpoint, Mapping):
+                endpoint = endpoint.get("path")
+            if not isinstance(endpoint, str) or not endpoint.startswith("/") or "?" in endpoint or any(char.isspace() for char in endpoint):
+                return None
+            paths.add(endpoint.rstrip("/") or "/")
+        return paths
+
+    async def _comment_api_state(self, transport: Any) -> _CommentApiState:
+        key = self._source_identity(transport)
+        state = self._comment_apis.get(key)
+        if state is None:
+            state = _CommentApiState()
+            self._comment_apis[key] = state
+        self._comment_apis.move_to_end(key)
+        while len(self._comment_apis) > MAX_CURSOR_STREAMS:
+            self._comment_apis.popitem(last=False)
+        async with state.lock:
+            if state.routes and time.monotonic() - state.updated < COMMENT_API_CACHE_TTL:
+                return state
+            timeout = min(self._cfg.api_timeout, 2.0)
+            try:
+                result = await asyncio.wait_for(
+                    self._fetch_response(transport, EndpointRequest(path="/docs", timeout=timeout), probe=True),
+                    timeout=timeout,
+                )
+                paths = self._documented_comment_routes(result.payload)
+            except asyncio.TimeoutError:
+                paths = None
+            modern = bool(paths and PATH_COMMENTS in paths)
+            state.routes = {
+                "hot": "classic" if paths and not modern and PATH_COMMENTS_HOT in paths else "modern",
+                "new": "classic" if paths and not modern and PATH_COMMENTS_MUSIC in paths else "modern",
+            }
+            state.modern_confirmed = modern
+            state.updated = time.monotonic()
+            state.generation += 1
         return state
 
     @staticmethod
@@ -266,7 +367,10 @@ class NeteaseProvider:
             song_id, limit=count, offset=(page - 1) * count, sort=sort,
             mode=MODE_SELF_HOSTED, timeout=self._cfg.api_timeout, cursor=cursor,
         )
-        payload = await self._fetch(transport, request)
+        result = await self._fetch_response(transport, request)
+        if result.status in UNSUPPORTED_ENDPOINT_STATUSES:
+            raise _UnsupportedCommentEndpoint()
+        payload = result.payload
         if payload is None:
             return None
         nested = payload.get("data")
@@ -310,8 +414,9 @@ class NeteaseProvider:
         final_data.pop("more", None)
         return parse_comments({"data": final_data}, self._comment_max_chars(), sort="new", offset=start)
 
-    async def _self_hosted_comments(
+    async def _modern_comments(
         self, song_id: str, transport: Any, count: int, start: int, sort: str,
+        *, probe_missing_endpoint: bool = False,
     ) -> CommentPage | None:
         if sort == "hot":
             return await self._collect_sorted_comments(song_id, transport, count, start, sort, {})
@@ -324,6 +429,10 @@ class NeteaseProvider:
                 cursors = dict(state.cursors)
             anchor = max(page for page in cursors if page <= first_page)
             if first_page - anchor > MAX_CURSOR_PREFETCH:
+                if probe_missing_endpoint:
+                    # 未知能力的旧服务仍需得到一次明确 HTTP 状态才可切换。
+                    # 成功、空页、权限或超时不会绕过现代接口的深页定位预算。
+                    await self._sorted_comment_page(song_id, transport, count, 1, "new", "0")
                 logger.warning("最新评论第 %d 页尚无游标，首次定位最多预取 %d 页；请从较浅页连续翻页", first_page, MAX_CURSOR_PREFETCH)
                 return None
             for page in range(anchor, first_page):
@@ -345,6 +454,65 @@ class NeteaseProvider:
                 state.cursors = {1: "0", **{page: cursors[page] for page in keep}}
                 state.updated = time.monotonic()
             return result
+
+    async def _classic_comments(
+        self, song_id: str, transport: Any, count: int, start: int, sort: str,
+    ) -> CommentPage | None:
+        request = build_classic_comments_request(
+            song_id, limit=count, offset=start, sort=sort, timeout=self._cfg.api_timeout,
+        )
+        result = await self._fetch_response(transport, request)
+        if result.status in UNSUPPORTED_ENDPOINT_STATUSES:
+            raise _UnsupportedCommentEndpoint()
+        if result.payload is None:
+            return None
+        nested = result.payload.get("data")
+        data = dict(nested) if isinstance(nested, Mapping) else dict(result.payload)
+        if sort == "hot":
+            # 专用热门端点有不同字段形态；空 hotComments 也是成功空页。
+            raws = data.get("hotComments") if "hotComments" in data else data.get("comments", data.get("list"))
+        else:
+            # music 首页附带的 hotComments 不属于普通评论 offset 分页。
+            raws = data.get("comments")
+        if not isinstance(raws, (list, tuple)):
+            logger.warning("旧版评论响应缺少对应评论列表")
+            return None
+        data["comments"] = list(raws[:count])
+        data.pop("hotComments", None)
+        return parse_comments({"data": data}, self._comment_max_chars(), sort="new", offset=start)
+
+    async def _self_hosted_comments(
+        self, song_id: str, transport: Any, count: int, start: int, sort: str,
+    ) -> CommentPage | None:
+        state = await self._comment_api_state(transport)
+        generation = state.generation
+        route = state.routes[sort]
+        try:
+            if route == "classic":
+                result = await self._classic_comments(song_id, transport, count, start, sort)
+            else:
+                result = await self._modern_comments(
+                    song_id, transport, count, start, sort,
+                    probe_missing_endpoint=not state.modern_confirmed,
+                )
+        except _UnsupportedCommentEndpoint:
+            route = "classic" if route == "modern" else "modern"
+            try:
+                result = (
+                    await self._classic_comments(song_id, transport, count, start, sort)
+                    if route == "classic" else
+                    await self._modern_comments(song_id, transport, count, start, sort)
+                )
+            except _UnsupportedCommentEndpoint:
+                return None
+        if result is not None:
+            async with state.lock:
+                if state.generation == generation:
+                    if state.routes[sort] != route:
+                        state.routes[sort] = route
+                        state.updated = time.monotonic()
+                    state.modern_confirmed = state.modern_confirmed or route == "modern"
+        return result
 
     # ------------------------------------------------------------ 协议方法
 

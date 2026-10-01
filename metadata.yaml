@@ -10,7 +10,7 @@ desc: |
   冷却秒数、每日限额、群白黑名单、用户黑名单、发送间隔与调试日志。
   歌词与评论都做了三级降级（HTML -> 安全文本图片 -> 纯文本），渲染服务不可用时不会让指令
   直接失败；歌曲卡片也做了降级（拿不到播放地址时自动退化为分享卡片或文本）。
-version: v0.1.0
+version: v0.1.1
 author: ysyhlly
 repo: "https://github.com/ysyhlly/astrbot_plugin_music"
 astrbot_version: ">=4.16,<5"
